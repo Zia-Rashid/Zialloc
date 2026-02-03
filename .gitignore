@@ -1,0 +1,31 @@
+# Build directories
+build/
+build_*/
+libs/
+
+# Compiled Object files
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+!CMakeLists.txt
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Allocator Sources (managed by setup_allocators.sh)
+allocators/mimalloc/mimalloc_src/
+allocators/jemalloc/jemalloc_src/

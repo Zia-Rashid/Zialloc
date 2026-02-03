@@ -1,0 +1,54 @@
+name: Allocator Test Suite CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Build Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential cmake autoconf automake libtool
+
+    - name: Setup Allocators (Local Build)
+      run: ./setup_allocators.sh
+
+    - name: Run Glibc Baseline Tests
+      run: make run-tests
+      continue-on-error: true
+
+    - name: Run Mimalloc Tests (Release)
+      run: make test-mimalloc
+      continue-on-error: true
+
+    - name: Run Mimalloc Tests (Secure)
+      run: make test-mimalloc-secure
+      continue-on-error: true
+
+    - name: Run Jemalloc Tests (Release)
+      run: make test-jemalloc
+      continue-on-error: true
+
+    - name: Run Jemalloc Tests (Debug)
+      run: make test-jemalloc-debug
+      continue-on-error: true
+
+    - name: Run Skeleton/MyAlloc Tests
+      run: make test-skeleton
+      continue-on-error: true
+
+    - name: Run Glibc Benchmarks (Full)
+      run: make bench-glibc
+      continue-on-error: true
+
+    - name: Run Skeleton Benchmarks (Full)
+      run: make bench-skeleton
+      continue-on-error: true
