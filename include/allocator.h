@@ -1,6 +1,4 @@
-#ifndef ALLOCATOR_H
-#define ALLOCATOR_H
-
+// ALLOCATOR_H
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -8,6 +6,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+
 
 typedef enum {
   GUARD_NONE = 0,
@@ -89,4 +89,5 @@ typedef struct allocator {
 }
 #endif
 
-#endif // ALLOCATOR_H
+
+// ALLOCATOR_H
