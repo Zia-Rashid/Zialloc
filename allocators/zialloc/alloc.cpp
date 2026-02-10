@@ -84,6 +84,8 @@ static void os_free(void *ptr, size_t size) {}
 
 static void *zialloc_malloc(size_t size) {
   return zialloc::Allocator::instance().malloc(size);
+  // fast path should use pages/chunks in tcache
+  // slow path is regular allocation
 }
 
 static void zialloc_free(void *ptr) {
