@@ -13,17 +13,54 @@
 namespace memory {
 
 // chunk and block are synonymous
-typedef struct chunk {  
-    void* page;  // page we belong w/i
-    bool in_use;
-    void* data;     // idk what datatype to make this but this is the body of the chunk
-    // we don't need to store what segment it belongs to b/c 
-    // that can be easily deduced w/ `segment_base = ptr & ~(SEGMENT_SIZE - 1)`
-} chunk_t;
+class Chunk {
+    private:
+        Page*       page;            // page we belong w/i
+        uint32_t    data_size : 31;  // usable size of data region (max ~2MiB)
+        uint32_t    in_use    : 1;   // packed into the same 8 bytes as data_size
+        void*       data;            // body of the chunk (user memory)
+        // we don't need to store what segment it belongs to b/c 
+        // that can be easily deduced w/ `segment_base = ptr & ~(SEGMENT_SIZE - 1)`
 
-typedef struct guard_chunk {
-    int64_t guard;  // software tagging mechanism 
-    // turn this into a class if necessary, and give it an 'integrity_check()' function.
+    public:
+        Chunk() : page(nullptr), in_use(false), data(nullptr), data_size(0) {}
+        Chunk(Page* owning_page, void* data_ptr, size_t size)
+            : page(owning_page), in_use(false), data(data_ptr), data_size(size) {}
+
+        void*   get_page()      const { return page; }
+        bool    is_in_use()     const { return in_use; }
+        void*   get_data()      const { return data; }  // this is what should be returned when "malloc" is called. 
+                                                        // this way they aren't overwriting the metadata, only the data
+                                                        // but we also have to make sure input is < data_size. 
+        size_t  get_data_size() const { return data_size; }
+        bool    set_data()      { 
+            bool is_changed{false};
+
+        }
+
+        void mark_used()    { in_use = true; }
+        void mark_free()    { in_use = false; }
+};
+
+// Placed at page boundaries: one before the first chunk, one after the last.
+// Page layout: |GuardChunk|chunk|chunk|...|chunk|GuardChunk|
+class GuardChunk {
+    private:
+        int64_t     pattern;    // known canary value, made at page init
+
+    public:
+        GuardChunk() : pattern(0) {}
+        GuardChunk(int64_t val) : pattern(val) {}
+
+        void set(int64_t val) { pattern = val; }
+
+        // Check if the guard is still intact. Call on free() or during
+        // validation to detect buffer overflows from neighboring chunks.
+        bool integrity_check(int64_t expected) const {
+            // If false, an overflow from an adjacent chunk corrupted the boundary.
+            INTEGRITY_CHECK(pattern == expected, "*** canary smashing detected *** ");
+            return true;
+        }
 };
 
 typedef struct tc_page_s {
@@ -50,7 +87,7 @@ typedef struct thread_cache {
 10      2     uint16_t capacity
 12      2     uint16_t reserved
 14      2     padding (align next pointer to 8)
-16      8     chunk_t* free
+16      8     Chunk* free
 24      2     uint16_t used
 26      6     padding (align size_t to 8)
 32      8     size_t chunk_sz
@@ -65,11 +102,11 @@ class Page {
                                         // if owned by a different thread, you shouldn't
                                         // be able to alloc memory from that page.
         uint32_t    slot_count;         // slots in this page
-        uint32_t    slot_off;           // dist from start of containg page.
         uint8_t     is_committed:1;     // 'true' if the page vmem is commited
 
-        uint16_t    capacity;           // num chunks committed to phys
+        uint16_t    num_committed;      // num chunks committed to phys
         uint16_t    reserved;           // num chunks reserved in vmem
+        uint16_t    capacity;           // maximum # of chunks in this page. floor(page_size/chunk_size)
         // page_flags?
 
         std::atomic<bool>   free_bm;    // bitmap of available free blocks for regular allocation 
@@ -78,38 +115,78 @@ class Page {
         // and then randomly pick one of those indices. This would likely 
         // be easier to implement.
 
-        std::vector<chunk*> freelist;   // freelist for tcache to improve locality. used in free's fast path
+        std::vector<Chunk*> freelist;   // freelist for tcache to improve locality. used in free's fast path
                                         // if used by slow path, choose random chunk using free_bm
         uint16_t    used;               // num chunks being used
         size_t      chunk_sz;           // size of the chunks in this slot.
-        chunk_t*    page_start;         // pointer to end of guard page in front chunks
+        Chunk*      page_start;         // pointer to first chunk (after front guard)
         // uintptr_t   keys[2];            // two random keys to encode the free lists
+
+        // ── Page boundary guards ──
+        // Layout: |front_guard|chunk|chunk|...|chunk|back_guard|
+        GuardChunk  front_guard;        // sits before first chunk
+        GuardChunk  back_guard;         // sits after last chunk
 
         page_status_t status;           // FULL, ACTIVE, or EMPTY
         uint64_t      prng_state;       // PRNG state for random free-slot selection (non-threaded pages)
 
+    public:
         Page()  = default;
         ~Page() = default;
-    public:
-        static Page& instance() {
-            static Page page;
-            return page; 
-        }
+
+        // Construct a page with its core layout parameters.
+        // guard_canary: value to stamp into front/back guards at init.
+        Page(size_t chunk_size, uint16_t max_capacity, int64_t guard_canary)
+            : slot_count(0), is_committed(0),
+              num_committed(0), reserved(0), capacity(max_capacity),
+              free_bm(false), used(0), chunk_sz(chunk_size),
+              page_start(nullptr),
+              front_guard(guard_canary), back_guard(guard_canary),
+              status(EMPTY), prng_state(0) {}
+
         void* find_space();             // this will likely be moved but my idea is that if we need to use realloc then we'd have to go back to the segment level and see if they have what we need. Could also be used for free() since it should be the segment that controls which pages get freed, not the page itself.
         void  tc_free_push();           // push chunk onto thread's free list, 
 
         // ── Free-path accessors (used by free.cpp) ──
 
         // Get the base address of this page's chunk data region
-        void* get_page_start() const {
-            // TODO: return page_start
-            return nullptr;
+        Chunk* get_page_start() const {
+            // as a security measure we should assert that this pointer is w/i the page 
+            return page_start;
         }
 
-        // Get the chunk size for this page
+        // Set page_start to the address of the first instantiated Chunk.
+        // Called once during page initialization after chunks are laid out.
+        void set_page_start(Chunk* first_chunk) {
+            // TODO: optionally validate that first_chunk is within this page's
+            //       committed region before accepting it
+            page_start = first_chunk;
+        }
+
+        // ── Guard accessors ──
+
+        // Initialize both boundary guards with a canary value (call at page init).
+        void init_guards(int64_t canary_val) {
+            front_guard.set(canary_val);
+            back_guard.set(canary_val);
+        }
+
+        // Verify both guards are intact. Returns false if either is corrupted.
+        bool check_guards(int64_t expected) const {
+            // TODO: return front_guard.integrity_check(expected) 
+            //         && back_guard.integrity_check(expected)
+            (void)expected;
+            return false;
+        }
+
+        GuardChunk&       get_front_guard()       { return front_guard; }
+        GuardChunk&       get_back_guard()        { return back_guard; }
+        const GuardChunk& get_front_guard() const { return front_guard; }
+        const GuardChunk& get_back_guard()  const { return back_guard; }
+
+        // Get the chunk size used in this page
         size_t get_chunk_size() const {
-            // TODO: return chunk_sz
-            return 0;
+            return chunk_sz;
         }
 
         // Get how many chunks are currently in use
@@ -309,7 +386,7 @@ class Heap {
     size of obj they're encapsulating. 
     ^ back to the free pages, scrap what i just said. I think we should also track the size w/i the metadata(for the page)
     and this will remain regardless of free'd status. This should be track to quickly re-allocate pages. <- update: we already
-    do this inside of chunk_t, that is mainly for the "freed" chunks
+    do this inside of Chunk, that is mainly for the "freed" chunks
     
     when it comes to accessing this page/slot metadata from outside of the corresponding chunk,
     instead of doing next and prev ptrs for the other slots, lets just make a vector corresponding to the segment.
@@ -350,3 +427,7 @@ class Heap {
     those are critical for the free dispatch in free.cpp.
     ═══════════════════════════════════════════════════════════════
 */
+
+
+// side note: I heard vector<bool> is not real and actually just uses bytes behind the scene 
+// so consider switching this to a uint# if size is known, otherwise continue w/ bools.

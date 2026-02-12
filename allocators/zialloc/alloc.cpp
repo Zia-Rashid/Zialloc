@@ -123,6 +123,7 @@ static void os_free(void *ptr, size_t size) {
     (void)ptr; (void)size;
 }
 
+// instead of making a new instance for each I just have to make one global instance
 static void *zialloc_malloc(size_t size) {
   return zialloc::Allocator::instance().malloc(size);
   // fast path should use pages/chunks in tcache

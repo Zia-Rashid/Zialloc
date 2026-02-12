@@ -21,7 +21,19 @@
 
 #include "types.h"
 #include <random>
+#include <iostream>
 #include <cstdint>
+
+
+#define INTEGRITY_CHECK(condition, message) \
+    do { \
+        if (!(condition)) { \
+            std::cerr << "Integrity Failure: " << message \
+                      << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
+            return std::abort; \
+        } \
+    } while (0)
+
 
 typedef enum page_kind_e {
     PAGE_SM,            // small blocks go into 64KiB pages inside a segment
