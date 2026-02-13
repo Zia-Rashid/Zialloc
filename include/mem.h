@@ -23,6 +23,10 @@
 #include <random>
 #include <iostream>
 #include <cstdint>
+#include <unistd.h>
+#include <syscall.h>
+#include <thread>     // for multi-thread 
+#include <mutex>      // for multi-threaded allocation
 
 
 #define INTEGRITY_CHECK(condition, message) \
@@ -30,7 +34,16 @@
         if (!(condition)) { \
             std::cerr << "Integrity Failure: " << message \
                       << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
-            return std::abort; \
+            std::abort(); \
+        } \
+    } while (0)
+
+#define PTR_IN_BOUNDS(condition, message) \
+    do { \
+        if (!(condition)) { \
+            std::cerr << "Illegal Pointer: " << message \
+                      << " at " << __FILE__ << ":" << __LINE__ << std::endl; \
+            std::abort(); \
         } \
     } while (0)
 
@@ -38,9 +51,16 @@
 typedef enum page_kind_e {
     PAGE_SM,            // small blocks go into 64KiB pages inside a segment
     PAGE_MED,           // medium   ^   ^   ^   512KiB   ^    ^    ^    ^
-    PAGE_LG,            // large    ^   ^   ^   1MB      ^    ^    ^    ^
+    PAGE_LG,            // large    ^   ^   ^   4MiB     ^    ^    ^    ^
     PAGE_XL             // x-large will either split(unlikely) or default to mmap.
 } page_kind_t;
+
+// PAGE_XL returns SEGMENT_SIZE as a ceiling — actual XL allocs are mmap'd.
+#define PAGE_KIND_SIZE(kind) \
+    ((kind) == PAGE_SM  ? (ZU(1) << SMALL_PAGE_SHIFT)  : \
+     (kind) == PAGE_MED ? (ZU(1) << MEDIUM_PAGE_SHIFT) : \
+     (kind) == PAGE_LG  ? LARGE_PAGE_SIZE              : \
+                          SEGMENT_SIZE)
 
 typedef enum segment_kind_e {
     SEGMENT_NORM,       // Most allocations
@@ -53,6 +73,17 @@ typedef enum page_status_e {
   ACTIVE,
   EMPTY
 } page_status_t;
+
+// all power aligned (i think), we can fill unused space w/ guard chunks.
+// max_chunk <= (usable / 2) - alignment // so, ...
+// Compute usable = P - overhead
+// Set max_chunk = floor(usable / 2)
+typedef enum chunk_max_e { 
+    CHUNK_SM = 0x7800,        // (30 KiB)     aligned + ensures we can fit <= 2 chunks.
+    CHUNK_MD = 0x3C000,       // (240 KiB) 
+    CHUNK_LG = 0x1FFF00,      // (2047 KiB)
+    CHUNK_XL                  // whatever it wants to be
+} chunk_max_t;
 
 
 // Memory can reside in arena's, direct OS allocated, or statically allocated. The memid keeps track of this.
@@ -88,6 +119,12 @@ typedef struct memid_s {
   bool          initially_committed;// `true` if the memory was originally allocated as committed
   bool          initially_zero;     // `true` if the memory was originally zero initialized
 } memid_t;  
+
+static inline pid_t current_tid() {
+    return syscall(SYS_gettid);
+}
+
+
 
 uint64_t generate_canary() {
     std::random_device rd; // Non-deterministic seed

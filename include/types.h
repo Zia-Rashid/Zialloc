@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <cmath>
 
 #define KB      1024        // actually KiB
 #define MB      (KB*KB)     // ^      ^ MiB

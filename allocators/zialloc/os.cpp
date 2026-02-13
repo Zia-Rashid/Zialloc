@@ -16,17 +16,19 @@
 namespace zialloc {
 namespace os {
 
-// ─────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────
-
-// Round `size` up to the nearest multiple of `alignment`.
-// Alignment must be a power of 2.
+// alignment has to be a power of 2.
 static inline size_t align_up(size_t size, size_t alignment) {
-    // TODO: return (size + alignment - 1) & ~(alignment - 1)
-    (void)size; (void)alignment;
-    return 0;
-}
+    return (size + alignment - 1) & ~(alignment - 1);
+}  
+/*
+        (0x37 + 0x10 - 1) & ~(0x10 - 1)
+        (0x37 + 0x0F)     & ~(0x0F)
+        (0x46)            & ~(0x0F)
+        0b0100_0110       & 0x0F = 0b0000_1111 -> ~0x0F = 0b1111_0000
+        & 0b1111_0000
+        ----------------
+        0b0100_0000    =>   0x40     
+*/
 
 // Return the system page size (typically 4096).
 static inline size_t get_page_size() {
@@ -35,30 +37,30 @@ static inline size_t get_page_size() {
 }
 
 
-// ─────────────────────────────────────────────
-// Core OS memory operations
-// ─────────────────────────────────────────────
+///////////////////////////////////
+//   Core OS memory operations   //
+///////////////////////////////////
 
-// Allocate `size` bytes of anonymous memory via mmap.
-// Returns nullptr on failure. Memory is initially zeroed by the kernel.
-// Flags: MAP_PRIVATE | MAP_ANONYMOUS
+// alloc `size` bytes of anonymous memory w/ mmap.
+// returns nullptr on failure. memory is initially zeroed by the kernel.
+// flags: MAP_PRIVATE | MAP_ANONYMOUS
 static void* os_mmap(size_t size) {
-    // TODO: 
-    //   void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-    //                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    //   if (ptr == MAP_FAILED) return nullptr;
-    //   return ptr;
-    (void)size;
-    return nullptr;
-}
+    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) return nullptr;
+    return ptr;
+}   
 
-// Allocate `size` bytes aligned to `alignment` via mmap.
+// /\ will be used internally for segment init and page reclaiming
+// --------------------------------------------------------------------------------------
+// \/ will only really be used by XL chunks so that the size is whatever they want it to be. 
+
+// alloc `size` bytes aligned to `alignment` via mmap.
 // Over-allocates by (alignment - 1) bytes, then trims the excess
 // using munmap on the leading/trailing slop.
 // This is the main entry point for segment allocation.
 static void* os_mmap_aligned(size_t size, size_t alignment) {
-    // TODO:
-    //   1. alloc_size = size + alignment - 1
+     //   1. alloc_size = size + alignment - 1
     //   2. raw = mmap(nullptr, alloc_size, ...)
     //   3. aligned = align_up((uintptr_t)raw, alignment)
     //   4. trim leading:  if (aligned > raw) munmap(raw, aligned - raw)
@@ -103,10 +105,6 @@ static void os_commit(void* ptr, size_t size) {
 }
 
 
-// ─────────────────────────────────────────────
-// Protection (NX / PROT_NONE for freed pages)
-// ─────────────────────────────────────────────
-
 // Remove all permissions on a page range (makes any access segfault).
 // Used on freed pages and guard pages.
 static void os_protect_none(void* ptr, size_t size) {
@@ -127,10 +125,6 @@ static void os_protect_ro(void* ptr, size_t size) {
 }
 
 
-// ─────────────────────────────────────────────
-// Guard pages
-// ─────────────────────────────────────────────
-
 // Create a guard page at `ptr` of `size` bytes.
 // A guard page is PROT_NONE memory that causes an immediate segfault
 // on any access — placed between segments and at page boundaries.
@@ -139,12 +133,8 @@ static bool os_create_guard(void* ptr, size_t size) {
     // Return true on success, false on failure.
     (void)ptr; (void)size;
     return false;
-}
+} // make sure to back the segments.cpp guard pages appropriately.
 
-
-// ─────────────────────────────────────────────
-// Huge pages (optional, for SEGMENT_HUGE)
-// ─────────────────────────────────────────────
 
 // Allocate using huge pages (2MiB on x86, MAP_HUGETLB).
 // Falls back to regular mmap on failure.

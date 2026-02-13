@@ -46,24 +46,21 @@ namespace zialloc {
 //   decode  = encoded  XOR key   (same operation)
 
 static inline uintptr_t encode_free_ptr(void* ptr, uint64_t segment_key) {
-    // TODO: XOR ptr with segment_key. Return the encoded value.
-    // Hint: cast ptr to uintptr_t, XOR, return.
-    (void)ptr; (void)segment_key;
-    return 0;
+    uintptr_t encoded_ptr = (uintptr_t)ptr ^ segment_key;
+    return encoded_ptr;
 }
 
 static inline void* decode_free_ptr(uintptr_t encoded, uint64_t segment_key) {
-    // TODO: reverse of encode_free_ptr
-    (void)encoded; (void)segment_key;
-    return nullptr;
+    uintptr_t decoded_ptr = (uintptr_t)encoded ^ segment_key;
+    return (void*)decoded_ptr;  // check correctness on this one
 }
 
 // Validate that a decoded pointer actually lands inside its segment.
-// segment_base = ptr & ~(SEGMENT_SIZE - 1)
 static inline bool validate_free_ptr(void* decoded_ptr, void* segment_base) {
-    // TODO: check decoded_ptr is within [segment_base, segment_base + SEGMENT_SIZE)
-    (void)decoded_ptr; (void)segment_base;
-    return false;
+    uintptr_t ub = (uintptr_t)decoded_ptr - (uintptr_t)segment_base;
+    uintptr_t diff = (uintptr_t)decoded_ptr - (uintptr_t)segment_base;
+    PTR_IN_BOUNDS( (0 < diff && diff < ub), "Illegal Pointer - not in bounds");
+    return true;
 }
 
 

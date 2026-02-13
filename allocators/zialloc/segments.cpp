@@ -71,9 +71,16 @@ typedef struct tc_page_s {
 } tc_page_t;
 
 typedef struct thread_cache {
+    pid_t                   tid;
+    thread_local TCache     tcache; // TODO: this isn't being recognized as correct
+    bool                    is_active;
     std::vector<tc_page_t*> active; // all the pages (slot sizes) that a tcache can handle
 } tc; // tomato cucumber 
 
+// i have to make functions to push to the vector, set tid, and set is_active. could make class if necessary.
+// actually 100% should turn this into a class. I want to maximize the multi-threaded capabilities
+// and tcache usage so I need to refactor the Pages to support that while still supporting 
+// non-thread_local allocation and keeping all of my security and design intentions.
 
 // page and slot are synonymous here.
 /*
@@ -97,10 +104,12 @@ Total: 48 bytes... for now.
 */
 class Page {
     private:
-        tc          owner_tid;          // if this page is handled by a singular thread in a
+        tc          owner_tc;          // if this page is handled by a singular thread in a
                                         // multi threaded env, this is that threads metadata
                                         // if owned by a different thread, you shouldn't
                                         // be able to alloc memory from that page.
+                                        // idk if this has to be a ptr or not.
+        page_kind_t size_class;
         uint32_t    slot_count;         // slots in this page
         uint8_t     is_committed:1;     // 'true' if the page vmem is commited
 
@@ -120,9 +129,7 @@ class Page {
         uint16_t    used;               // num chunks being used
         size_t      chunk_sz;           // size of the chunks in this slot.
         Chunk*      page_start;         // pointer to first chunk (after front guard)
-        // uintptr_t   keys[2];            // two random keys to encode the free lists
 
-        // ── Page boundary guards ──
         // Layout: |front_guard|chunk|chunk|...|chunk|back_guard|
         GuardChunk  front_guard;        // sits before first chunk
         GuardChunk  back_guard;         // sits after last chunk
@@ -144,39 +151,39 @@ class Page {
               front_guard(guard_canary), back_guard(guard_canary),
               status(EMPTY), prng_state(0) {}
 
-        void* find_space();             // this will likely be moved but my idea is that if we need to use realloc then we'd have to go back to the segment level and see if they have what we need. Could also be used for free() since it should be the segment that controls which pages get freed, not the page itself.
-        void  tc_free_push();           // push chunk onto thread's free list, 
+        void* find_space();  // this will likely be moved but my idea is that if we need to use realloc then we'd have to go back to the segment level and see if they have what we need. Could also be used for free() since it should be the segment that controls which pages get freed, not the page itself.
 
         // ── Free-path accessors (used by free.cpp) ──
 
         // Get the base address of this page's chunk data region
         Chunk* get_page_start() const {
-            // as a security measure we should assert that this pointer is w/i the page 
+            // as a security measure we should assert that this pointer is w/i the page
+            uintptr_t base = (uintptr_t)this;
+            uintptr_t ptr  = (uintptr_t)page_start;
+            PTR_IN_BOUNDS((base < ptr && ptr < (base + PAGE_KIND_SIZE(size_class))),
+                          "Illegal Pointer - not in bounds");
             return page_start;
         }
 
         // Set page_start to the address of the first instantiated Chunk.
-        // Called once during page initialization after chunks are laid out.
         void set_page_start(Chunk* first_chunk) {
-            // TODO: optionally validate that first_chunk is within this page's
-            //       committed region before accepting it
+            uintptr_t base = (uintptr_t)this;
+            uintptr_t ptr = (uintptr_t)first_chunk;
+            PTR_IN_BOUNDS((base < ptr && ptr < (base + PAGE_KIND_SIZE(size_class))),
+                          "Illegal Pointer - not in bounds");
             page_start = first_chunk;
         }
 
-        // ── Guard accessors ──
-
-        // Initialize both boundary guards with a canary value (call at page init).
+        // called at page init
         void init_guards(int64_t canary_val) {
             front_guard.set(canary_val);
             back_guard.set(canary_val);
         }
 
-        // Verify both guards are intact. Returns false if either is corrupted.
+        // Will abort if either are corrupted
         bool check_guards(int64_t expected) const {
-            // TODO: return front_guard.integrity_check(expected) 
-            //         && back_guard.integrity_check(expected)
-            (void)expected;
-            return false;
+            return front_guard.integrity_check(expected) 
+                 && back_guard.integrity_check(expected);
         }
 
         GuardChunk&       get_front_guard()       { return front_guard; }
@@ -184,67 +191,66 @@ class Page {
         const GuardChunk& get_front_guard() const { return front_guard; }
         const GuardChunk& get_back_guard()  const { return back_guard; }
 
-        // Get the chunk size used in this page
         size_t get_chunk_size() const {
             return chunk_sz;
         }
 
-        // Get how many chunks are currently in use
+        // how many are currently in use
         uint16_t get_used() const {
-            // TODO: return used
-            return 0;
+            return used;
         }
 
-        // Decrement used count and update page status accordingly
+        // decrement used count & update page status 
         void dec_used() {
-            // TODO: used--, then update status:
-            //   if (used == 0) status = EMPTY;
-            //   else if (status == FULL) status = ACTIVE;  // was full, now has space
+            used--;
+            if (used == 0) status = EMPTY;
+            else if (status == FULL) status = ACTIVE;  // was full, now has space
         }
-
+        // inc and dec should have corresponding funcs to update alloc bitmap
         // Increment used count and update page status
         void inc_used() {
-            // TODO: used++, then update status:
-            //   if (used == capacity) status = FULL;
-            //   else status = ACTIVE;
+            used++;
+            if (used == capacity) status = FULL;
+            else status = ACTIVE;
         }
 
         // Check if this page is owned by the calling thread
         bool is_owned_by_current_thread() const {
-            // TODO: compare owner_tid against current thread id
-            return false;
+            return owner_tc.tid == current_tid();
         }
 
         // Check if this page is used by a tcache (threaded fast-path)
         bool is_tcache_page() const {
-            // TODO: return true if owner_tid is valid / freelist is active
-            return false;
+            return owner_tc.is_active; // change to pointer if necessary
         }
 
-        // Get current page status
+        // get current page status
         page_status_t get_status() const {
-            // TODO: return status
-            return EMPTY;
+            return status;
         }
 
         // Compute the slot index from a chunk pointer
         uint16_t slot_index_of(void* chunk_ptr) const {
-            // TODO: return (uintptr_t(chunk_ptr) - uintptr_t(page_start)) / chunk_sz
-            (void)chunk_ptr;
-            return 0;
+            return (uintptr_t(chunk_ptr) - uintptr_t(page_start)) / chunk_sz;
         }
 
         // Get the PRNG state for random allocation (non-threaded pages)
-        uint64_t next_prng() {
+        uint64_t next_prng() { 
             // TODO: xorshift64 on prng_state, return result
             return 0;
         }
+
+        // <type> tc_get_next_free_chunk(); // pops end of freelist
+        // <type> choose_rand_free_chunk(); // chooses random idx from free list.
+        // issue w/ the above - main thread may have to be an exception
+        // otherwise the 2nd function will simply never be used and the 
+        // randomization capability will never be utilized.
 };
 
 
 class Segment {
     private:
-        page_kind_t            sz_class;    // small, medium, large, XL (determines offsets per slot)
+        page_kind_t            size_class;  // small, medium, large, XL (determines offsets per slot)
         std::vector<Page>      slots;       // metadata for contained pages.
         std::vector<bool>      active;      // bitmap to track the status of a given page so we can free phys mem if necessary.
         uint64_t               canary;
@@ -262,59 +268,47 @@ class Segment {
             return segment;
         }
 
-        // ── Free-path accessors (used by free.cpp) ──
-
-        // Get the segment key for pointer encoding/decoding
+        // for pointer encoding/decoding
         uint64_t get_key() const {
-            // TODO: return key
-            return 0;
+            return key;
         }
 
-        // Initialize the segment key (call once at segment creation)
+        // call once at segment creation
         void init_key() {
-            // TODO: key = generate_canary()  (reuse the PRNG from mem.h)
+            key = generate_canary();
         }
 
-        // Look up the Page metadata for a given pointer within this segment.
-        // Use the page kind + offset arithmetic to find which slot it belongs to.
+        // Lookup the page metadata for a given pointer within this segment.
         Page* find_page_for(void* ptr) {
-            // TODO: 
-            //   offset = (uintptr_t)ptr - (uintptr_t)this_segment_base
-            //   page_index = offset / page_size_for(sz_class)
-            //   return &slots[page_index]
-            (void)ptr;
-            return nullptr;
+            auto offset = (uintptr_t)ptr - (uintptr_t)this;      // <- segment base
+            auto page_index = offset / PAGE_KIND_SIZE(size_class);
+            return &slots[page_index];
         }
 
-        // Check if ALL pages in this segment are EMPTY (reclaimable to OS)
+        // Check tha all pages in this segment are EMPTY (reclaimable to OS)
         bool is_fully_empty() const {
-            // TODO: walk slots, return false if any page.get_status() != EMPTY
-            return false;
+            for (size_t i = 0; i < slots.size(); ++i) {
+                page_status_t status = slots.at(i).get_status(); 
+                if (status != EMPTY) 
+                    return false;      
+            }
+            return true;
         }
 
-        // Mark a page slot as inactive in the bitmap
         void mark_page_inactive(uint16_t page_index) {
-            // TODO: active[page_index] = false
-            (void)page_index;
+            active[page_index] = false;
         }
 
-        // Mark a page slot as active in the bitmap
         void mark_page_active(uint16_t page_index) {
-            // TODO: active[page_index] = true
-            (void)page_index;
+            active[page_index] = true;
         }
 
-        // Verify canary integrity
         bool check_canary(uint64_t expected) const {
-            // TODO: return canary == expected
-            (void)expected;
-            return false;
+            return canary == expected;
         }
 
-        // Get the number of page slots in this segment
         size_t num_pages() const {
-            // TODO: return slots.size()
-            return 0;
+            return slots.size();
         }
 };
 
@@ -341,31 +335,26 @@ class Heap {
             static Heap heap;
             return heap;
         }
-
-        // ── Free-path accessors (used by free.cpp) ──
-
+        
         // Find the Segment that contains `ptr`.
         // segment_base = ptr & ~(SEGMENT_SIZE - 1), then look up in layout.
         Segment* find_segment_for(void* ptr) {
-            // TODO:
-            //   uintptr_t seg_base = (uintptr_t)ptr & ~SEGMENT_MASK;
-            //   uintptr_t heap_base = (uintptr_t)base.get();
-            //   size_t seg_index = (seg_base - heap_base) / SEGMENT_SIZE;
-            //   return &layout[seg_index];
-            (void)ptr;
-            return nullptr;
+            uintptr_t seg_base = (uintptr_t)ptr & ~SEGMENT_MASK;
+            uintptr_t heap_base = (uintptr_t)base.get();
+            size_t seg_index = (seg_base - heap_base) / SEGMENT_SIZE;
+            return &layout[seg_index];
         }
+        // idk if this will work as is becasue the start of the heap isn't necessarily 
+        // a segment right away - could be metadata
 
         // Remove a segment from the heap (after full release to OS).
         void remove_segment(uint32_t seg_index) {
             // TODO: update layout, seg_kind, num_segments
             (void)seg_index;
-        }
+        }   // worry abt this later
 
-        // Get the base pointer of the heap
         void* get_base() const {
-            // TODO: return base.get()
-            return nullptr;
+            return base.get();
         }
 };
 
