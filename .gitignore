@@ -5,6 +5,7 @@ docs/plan.md
 build/
 build_*/
 libs/
+bin/
 
 # Compiled Object files
 *.o

@@ -12,12 +12,12 @@
 #include <unistd.h>
 
 #include "types.h"
+#include "zialloc_memory.hpp"
 
 namespace zialloc {
 namespace os {
 
-// alignment has to be a power of 2.
-static inline size_t align_up(size_t size, size_t alignment) {
+constexpr static inline size_t align_up(size_t size, size_t alignment) {
     return (size + alignment - 1) & ~(alignment - 1);
 }  
 /*
@@ -30,20 +30,13 @@ static inline size_t align_up(size_t size, size_t alignment) {
         0b0100_0000    =>   0x40     
 */
 
-// Return the system page size (typically 4096).
 static inline size_t get_page_size() {
-    // TODO: call sysconf(_SC_PAGESIZE) or use getpagesize()
-    return 0;
+    static size_t pgsz = (size_t)sysconf(_SC_PAGESIZE);
+    return pgsz;
 }
 
-
-///////////////////////////////////
-//   Core OS memory operations   //
-///////////////////////////////////
-
-// alloc `size` bytes of anonymous memory w/ mmap.
-// returns nullptr on failure. memory is initially zeroed by the kernel.
-// flags: MAP_PRIVATE | MAP_ANONYMOUS
+// alloc `size` bytes of anonymous memory w/ mmap
+// rets nullptr if fail, mem is zero init'd
 static void* os_mmap(size_t size) {
     void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -55,186 +48,182 @@ static void* os_mmap(size_t size) {
 // --------------------------------------------------------------------------------------
 // \/ will only really be used by XL chunks so that the size is whatever they want it to be. 
 
-// alloc `size` bytes aligned to `alignment` via mmap.
-// Over-allocates by (alignment - 1) bytes, then trims the excess
-// using munmap on the leading/trailing slop.
-// This is the main entry point for segment allocation.
+// alloc `size` bytes aligned to `alignment` w/i mmap
 static void* os_mmap_aligned(size_t size, size_t alignment) {
-     //   1. alloc_size = size + alignment - 1
-    //   2. raw = mmap(nullptr, alloc_size, ...)
-    //   3. aligned = align_up((uintptr_t)raw, alignment)
-    //   4. trim leading:  if (aligned > raw) munmap(raw, aligned - raw)
-    //   5. trim trailing: end = aligned + size; raw_end = raw + alloc_size;
-    //                     if (raw_end > end) munmap(end, raw_end - end)
-    //   6. return (void*)aligned
-    (void)size; (void)alignment;
-    return nullptr;
+    // over-allocate so we can find an aligned region inside
+    size_t alloc_size = size + alignment - 1;
+    void* raw = os_mmap(alloc_size);
+    if (!raw) return nullptr;
+
+    uintptr_t raw_addr = (uintptr_t)raw;
+    uintptr_t aligned  = align_up(raw_addr, alignment);
+
+    // trim leading slop
+    if (aligned > raw_addr)
+        munmap(raw, aligned - raw_addr);
+
+    // trim trailing slop
+    uintptr_t end     = aligned + size;
+    uintptr_t raw_end = raw_addr + alloc_size;
+    if (raw_end > end)
+        munmap((void*)end, raw_end - end);
+
+    return (void*)aligned;
 }
 
-// Release memory back to the OS entirely (virtual + physical).
-// Used when an entire segment can be unmapped.
+// used when an entire segment can be unmapped (virt + phys)
 static void os_munmap(void* ptr, size_t size) {
-    // TODO: munmap(ptr, size)
-    (void)ptr; (void)size;
+    munmap(ptr, size);
 }
 
-
-// ─────────────────────────────────────────────
-// Physical memory management (keep vmem, release phys)
-// ─────────────────────────────────────────────
-
-// Release physical pages but keep the virtual address reservation.
-// Any subsequent access to this range will re-fault in zeroed pages.
-// This is what we use for freed pages to:
+// release physical pages but keep the virtual address reservation
+// access will re-fault in zeroed pages.
+// This is what we use for freed pages to:      (for the documentation)
 //   a) reduce RSS
 //   b) give UAF segfault protection (reads return zero, not stale data)
 static void os_decommit(void* ptr, size_t size) {
-    // TODO: madvise(ptr, size, MADV_DONTNEED)
-    // On newer kernels you could also try MADV_FREE (lazy reclaim)
-    (void)ptr; (void)size;
+    madvise(ptr, size, MADV_DONTNEED);
 }
 
-// Re-commit previously decommitted pages (no-op on Linux, 
-// since touching the page auto-faults it back in, but good
-// to have as a semantic marker and for portability).
 static void os_commit(void* ptr, size_t size) {
-    // TODO: on Linux this is essentially a no-op.
-    // On other OSes (Windows) you'd call VirtualAlloc(..., MEM_COMMIT, ...).
-    // For now, consider madvise(ptr, size, MADV_WILLNEED) as a hint.
-    (void)ptr; (void)size;
+    // hint to kernel to prefault pages (semantically a no-op on Linux)
+    madvise(ptr, size, MADV_WILLNEED);
 }
 
-
-// Remove all permissions on a page range (makes any access segfault).
-// Used on freed pages and guard pages.
+// Remove all permissions on a page range (makes any access segfault)
+// for freed / guard pages
 static void os_protect_none(void* ptr, size_t size) {
-    // TODO: mprotect(ptr, size, PROT_NONE)
-    (void)ptr; (void)size;
+    mprotect(ptr, size, PROT_NONE);
 }
 
-// Restore read+write on a page range (before re-allocating it).
+// make RW (before re-allocating it)
 static void os_protect_rw(void* ptr, size_t size) {
-    // TODO: mprotect(ptr, size, PROT_READ | PROT_WRITE)
-    (void)ptr; (void)size;
+    mprotect(ptr, size, PROT_READ | PROT_WRITE);
 }
 
-// Mark a page range read-only (useful for metadata pages).
-static void os_protect_ro(void* ptr, size_t size) {
-    // TODO: mprotect(ptr, size, PROT_READ)
-    (void)ptr; (void)size;
+// make RO (useful for metadata)
+[[maybe_unused]] static void os_protect_ro(void* ptr, size_t size) {
+    mprotect(ptr, size, PROT_READ);
 }
 
 
 // Create a guard page at `ptr` of `size` bytes.
-// A guard page is PROT_NONE memory that causes an immediate segfault
-// on any access — placed between segments and at page boundaries.
 static bool os_create_guard(void* ptr, size_t size) {
-    // TODO: mprotect(ptr, size, PROT_NONE)
-    // Return true on success, false on failure.
-    (void)ptr; (void)size;
-    return false;
-} // make sure to back the segments.cpp guard pages appropriately.
+    // PROT_NONE causes immediate segfault on any access
+    return mprotect(ptr, size, PROT_NONE) == 0;
+} 
 
 
-// Allocate using huge pages (2MiB on x86, MAP_HUGETLB).
-// Falls back to regular mmap on failure.
-static void* os_mmap_huge(size_t size) {
-    // TODO:
-    //   void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
-    //                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-    //   if (ptr == MAP_FAILED) return os_mmap(size);  // fallback
-    //   return ptr;
-    (void)size;
-    return nullptr;
+// allocate using huge pages 
+[[maybe_unused]] static void* os_mmap_huge(size_t size) {
+    // Try 2MiB huge pages; fall back to regular mmap on failure
+    void* ptr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+    if (ptr == MAP_FAILED) return os_mmap(size);
+    return ptr;
 }
 
+// reserve virt addr space w/o committing phys mem
+// have to use commit_region to make it usable
+static void* os_reserve_region(size_t size) {
+    void* ptr = mmap(nullptr, size, PROT_NONE,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (ptr == MAP_FAILED) return nullptr;
+    return ptr;
+}
 
-// ─────────────────────────────────────────────
-// High-level wrappers (used by segments.cpp / alloc.cpp)
-// ─────────────────────────────────────────────
+// commit a subrange of a reserved region ot phys (make it read/write)
+// range must be w/i a region previously returned by os_reserve_region
+static bool os_commit_region(void* ptr, size_t size) {
+    return mprotect(ptr, size, PROT_READ | PROT_WRITE) == 0;
+}
 
-// Allocate a new segment-aligned region of `size` bytes.
-// This is the primary function segments.cpp will call.
+// alloc a new segment-aligned region of `size` bytes.
 void* alloc_segment(size_t size) {
-    // TODO: return os_mmap_aligned(size, SEGMENT_ALIGN)
-    (void)size;
-    return nullptr;
+    return os_mmap_aligned(size, SEGMENT_ALIGN);
 }
 
-// Free an entire segment region.
+void* reserve_region(size_t size) {
+    return os_reserve_region(size);
+}
+
+bool commit_region(void* ptr, size_t size) {
+    return os_commit_region(ptr, size);
+}
+
 void free_segment(void* ptr, size_t size) {
-    // TODO: os_munmap(ptr, size)
-    (void)ptr; (void)size;
+    os_munmap(ptr, size);
 }
 
-// Decommit a page range within a segment (free physical, keep virtual).
+// free physical, keep virtual
 void decommit_pages(void* ptr, size_t size) {
-    // TODO: os_decommit(ptr, size)
-    (void)ptr; (void)size;
+    os_decommit(ptr, size);
 }
 
-// Recommit a page range within a segment before re-use.
+// recommit a page range w/i a segment
 void commit_pages(void* ptr, size_t size) {
-    // TODO: os_commit(ptr, size)
-    (void)ptr; (void)size;
+    os_commit(ptr, size);
 }
 
-// Set up a guard page.
 bool setup_guard(void* ptr, size_t size) {
-    // TODO: return os_create_guard(ptr, size)
-    (void)ptr; (void)size;
-    return false;
+    return os_create_guard(ptr, size);
 }
 
-// Lock a freed page so any access segfaults.
+// any access segfaults.
 void lock_page(void* ptr, size_t size) {
-    // TODO: os_protect_none(ptr, size)
-    (void)ptr; (void)size;
+    os_protect_none(ptr, size);
 }
 
-// Unlock a page for allocation.
 void unlock_page(void* ptr, size_t size) {
-    // TODO: os_protect_rw(ptr, size)
-    (void)ptr; (void)size;
+    os_protect_rw(ptr, size);
 }
 
 
 }  // namespace os
 }  // namespace zialloc
 
+namespace zialloc::memory {
 
-/*
-    ═══════════════════════════════════════════════════════════════
-    WHAT TO DO NEXT (os.cpp):
-    ═══════════════════════════════════════════════════════════════
+size_t align_up(size_t size, size_t alignment) {
+    return zialloc::os::align_up(size, alignment);
+}
 
-    1. BASICS FIRST: Implement align_up() and get_page_size().
-       These are one-liners — align_up is bitmask arithmetic,
-       get_page_size wraps sysconf(_SC_PAGESIZE).
+void* alloc_segment(size_t size) {
+    return zialloc::os::alloc_segment(size);
+}
 
-    2. CORE MMAP: Implement os_mmap() — straightforward mmap call.
-       Then os_mmap_aligned() which over-allocates + trims.
-       Then os_munmap() — just munmap().
+void* reserve_region(size_t size) {
+    return zialloc::os::reserve_region(size);
+}
 
-    3. DECOMMIT / COMMIT: Implement os_decommit() with 
-       madvise(MADV_DONTNEED). os_commit() is a no-op on Linux
-       but add MADV_WILLNEED as a hint.
+bool commit_region(void* ptr, size_t size) {
+    return zialloc::os::commit_region(ptr, size);
+}
 
-    4. PROTECTION: Implement os_protect_none/rw/ro using mprotect().
-       These are all one-liners with different prot flags.
+void free_segment(void* ptr, size_t size) {
+    zialloc::os::free_segment(ptr, size);
+}
 
-    5. GUARD PAGES: os_create_guard() is just mprotect(PROT_NONE).
+void decommit_pages(void* ptr, size_t size) {
+    zialloc::os::decommit_pages(ptr, size);
+}
 
-    6. HUGE PAGES: os_mmap_huge() tries MAP_HUGETLB, falls back.
-       This is low priority — implement last.
+void commit_pages(void* ptr, size_t size) {
+    zialloc::os::commit_pages(ptr, size);
+}
 
-    7. HIGH-LEVEL WRAPPERS: Once the static helpers above work,
-       the public wrappers (alloc_segment, free_segment, etc.) 
-       are trivial pass-throughs. Wire them up.
+bool setup_guard(void* ptr, size_t size) {
+    return zialloc::os::setup_guard(ptr, size);
+}
 
-    Recommended order: 1 → 2 → 3 → 7 → 4 → 5 → 6
-    Get alloc_segment / free_segment working first so you can 
-    test segment creation in segments.cpp before worrying about
-    page protection and security features.
-    ═══════════════════════════════════════════════════════════════
-*/
+void lock_page(void* ptr, size_t size) {
+    zialloc::os::lock_page(ptr, size);
+}
+
+void unlock_page(void* ptr, size_t size) {
+    zialloc::os::unlock_page(ptr, size);
+}
+
+} // namespace zialloc::memory
+
+

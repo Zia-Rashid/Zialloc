@@ -1,276 +1,306 @@
-// Build: make ALLOCATOR=allocators/<yourname>/youralloc.c run-tests
-
 #include "allocator.h"
+#include "mem.h"
 #include "types.h"
-#include "segments.cpp"
-#include "os.cpp"
-#include "free.cpp"
+#include "zialloc_memory.hpp"
+
 #include <cstddef>
 #include <cstdint>
+#include <atomic>
+#include <cstdio>
 #include <cstring>
-#include <sys/mman.h>
-#include <unistd.h>
+
+static bool g_initialized = false;
+static allocator_stats_t g_stats{};
+static std::atomic<uint64_t> g_alloc_count{0};
+static std::atomic<uint64_t> g_free_count{0};
+static std::atomic<uint64_t> g_realloc_count{0};
+static std::atomic<size_t> g_bytes_allocated{0};
+static std::atomic<int64_t> g_bytes_in_use{0};
+
+namespace {
+struct LocalStatsBatch {
+  uint64_t alloc_count;
+  uint64_t free_count;
+  uint64_t realloc_count;
+  size_t bytes_allocated;
+  int64_t bytes_in_use_delta;
+  uint32_t ops;
+};
+
+static thread_local LocalStatsBatch g_local_stats{0, 0, 0, 0, 0, 0};
+static constexpr uint32_t STATS_FLUSH_INTERVAL = 256;
+
+static inline void flush_local_stats_batch() {
+  if (g_local_stats.alloc_count) {
+    g_alloc_count.fetch_add(g_local_stats.alloc_count, std::memory_order_relaxed);
+    g_local_stats.alloc_count = 0;
+  }
+  if (g_local_stats.free_count) {
+    g_free_count.fetch_add(g_local_stats.free_count, std::memory_order_relaxed);
+    g_local_stats.free_count = 0;
+  }
+  if (g_local_stats.realloc_count) {
+    g_realloc_count.fetch_add(g_local_stats.realloc_count, std::memory_order_relaxed);
+    g_local_stats.realloc_count = 0;
+  }
+  if (g_local_stats.bytes_allocated) {
+    g_bytes_allocated.fetch_add(g_local_stats.bytes_allocated, std::memory_order_relaxed);
+    g_local_stats.bytes_allocated = 0;
+  }
+  if (g_local_stats.bytes_in_use_delta != 0) {
+    g_bytes_in_use.fetch_add(g_local_stats.bytes_in_use_delta, std::memory_order_relaxed);
+    g_local_stats.bytes_in_use_delta = 0;
+  }
+  g_local_stats.ops = 0;
+}
+
+static inline void maybe_flush_local_stats_batch() {
+  g_local_stats.ops++;
+  if (g_local_stats.ops >= STATS_FLUSH_INTERVAL) {
+    flush_local_stats_batch();
+  }
+}
+} // namespace
+
+static int zialloc_init(void);
+static void zialloc_teardown(void);
+static void zialloc_print_stats(void);
+static bool zialloc_get_stats(allocator_stats_t *stats);
+static bool zialloc_validate_heap(void);
+static size_t zialloc_usable_size(void *ptr);
+static allocator_stats_t zialloc_snapshot_stats(void);
 
 namespace zialloc {
 
 class Allocator {
-    public:
-        static Allocator& instance() {
-            static Allocator alloc;
-            return alloc;
-        }
-        void*   malloc(size_t size);
-        void    free(void* ptr); 
-        void*   realloc(void* ptr, size_t size);
-        void*   calloc(size_t nmemb, size_t size);
+public:
+  static Allocator &instance() {
+    static Allocator alloc;
+    return alloc;
+  }
 
-        bool    init();
-        void    teardown();
-        void    print_stats();
-        bool    get_stats(allocator_stats_t* stats);
-        void    print_features();
-        bool    get_feats(allocator_features_t* feats);
-        bool    validate_heap();
+  void *malloc(size_t size);
+  void free(void *ptr);
+  void *realloc(void *ptr, size_t size);
+  void *calloc(size_t nmemb, size_t size);
 
-    private:
-        Allocator() = default;
-        ~Allocator() = default;
-       
-        allocator_stats_t stats{};
+private:
+  Allocator() = default;
+  ~Allocator() = default;
 };
 
-void* Allocator::malloc(size_t size) {
-    // TODO: 
-    //   1. Determine size class (small / med / large / XL)
-    //   2. Fast path: check tcache for a free chunk of this size
-    //   3. Slow path: find a page with space via Heap -> Segment -> Page
-    //   4. If no page has space, allocate a new segment via os::alloc_segment()
-    //   5. Update stats (alloc_count, bytes_in_use, etc.)
-    //   6. Return pointer to chunk data
-    (void)size;
+void *Allocator::malloc(size_t size) {
+  if (size == 0)
     return nullptr;
-}
-
-void Allocator::free(void* ptr) {
-    // TODO: delegate to the free dispatch in free.cpp
-    //   zialloc::zialloc_free_dispatch(ptr);
-    //   Update stats (free_count, bytes_in_use, etc.)
-    (void)ptr;
-}
-
-void* Allocator::realloc(void* ptr, size_t size) {
-    // TODO:
-    //   1. If ptr == nullptr, equivalent to malloc(size)
-    //   2. If size == 0, equivalent to free(ptr), return nullptr
-    //   3. Find the chunk's current size via Page::get_chunk_size()
-    //   4. If new size fits in current chunk, return ptr as-is
-    //   5. Otherwise: malloc(size), memcpy, free(ptr)
-    //   6. Update stats (realloc_count)
-    (void)ptr; (void)size;
+  if (size >= (SIZE_MAX - 4096))
     return nullptr;
-}
-
-// nmemb is the # of values of size `size`. So calloc(4, sizeof(int)) may produce a 16 bytes chunk
-void* Allocator::calloc(size_t nmemb, size_t size) {   
-    // TODO:
-    //   1. Check for overflow: nmemb * size
-    //   2. total = nmemb * size
-    //   3. ptr = malloc(total)
-    //   4. memset(ptr, 0, total)  — or skip if os_mmap already zeroed it
-    //   5. return ptr
-    (void)nmemb; (void)size;
+  if (size > HEAP_RESERVED_DEFAULT)
     return nullptr;
-}
-
-
-}   
-
-/*
-    since I'm going to do all chunk metadata in one system page
-    they will not be at the beginning of each chunk. 
-    only the free pages will need *next and *prev.
-*/
-
-
-static bool g_initialized = false;
-
-// TODO: Add your allocator state
-// static void* g_heap_start = NULL;
-// static size_t g_heap_size = 0;
-// static chunk_header_t* g_free_list = NULL;
-
-// Statistics tracking
-static allocator_stats_t g_stats = {0};
-
-// Round up to alignment — delegate to os.cpp
-static inline size_t align_up(size_t size, size_t alignment) {
-    // TODO: return zialloc::os::align_up(size, alignment)
-    //   or inline: (size + alignment - 1) & ~(alignment - 1)
-    (void)size; (void)alignment;
-    return 0;
-}
-
-// Get memory from OS — delegate to os.cpp
-static void *os_alloc(size_t size) {
-    // TODO: return zialloc::os::alloc_segment(size)
-    (void)size;
+  if (!g_initialized && zialloc_init() != 0)
     return nullptr;
+
+  void *ptr = memory::heap_alloc(size);
+  if (!ptr)
+    return nullptr;
+
+  size_t usable = memory::heap_usable_size(ptr);
+  g_local_stats.alloc_count++;
+  g_local_stats.bytes_allocated += size;
+  g_local_stats.bytes_in_use_delta += static_cast<int64_t>(usable);
+  maybe_flush_local_stats_batch();
+  return ptr;
 }
 
-// Return memory to OS — delegate to os.cpp
-static void os_free(void *ptr, size_t size) {
-    // TODO: zialloc::os::free_segment(ptr, size)
-    (void)ptr; (void)size;
+void Allocator::free(void *ptr) {
+  if (!ptr)
+    return;
+  IS_HEAP_INITIALIZED(g_initialized);
+
+  size_t usable = 0;
+  if (!memory::free_dispatch_with_size(ptr, &usable))
+    std::abort();
+
+  g_local_stats.free_count++;
+  g_local_stats.bytes_in_use_delta -= static_cast<int64_t>(usable);
+  maybe_flush_local_stats_batch();
 }
 
-// instead of making a new instance for each I just have to make one global instance
+void *Allocator::realloc(void *ptr, size_t size) {
+  if (ptr == nullptr)
+    return malloc(size);
+  IS_HEAP_INITIALIZED(g_initialized);
+  if (size == 0) {
+    free(ptr);
+    return nullptr;
+  }
+
+  size_t old_usable = memory::heap_usable_size(ptr);
+  if (old_usable >= size) {
+    g_local_stats.realloc_count++;
+    maybe_flush_local_stats_batch();
+    return ptr;
+  }
+
+  void *new_ptr = malloc(size);
+  if (!new_ptr)
+    return nullptr;
+
+  std::memcpy(new_ptr, ptr, old_usable);
+  free(ptr);
+  g_local_stats.realloc_count++;
+  maybe_flush_local_stats_batch();
+  return new_ptr;
+}
+
+void *Allocator::calloc(size_t nmemb, size_t size) {
+  if (nmemb != 0 && size > SIZE_MAX / nmemb)
+    return nullptr;
+  size_t total = nmemb * size;
+  void *ptr = malloc(total);
+  if (!ptr)
+    return nullptr;
+  std::memset(ptr, 0, total);
+  return ptr;
+}
+
+} // namespace zialloc
+
 static void *zialloc_malloc(size_t size) {
   return zialloc::Allocator::instance().malloc(size);
-  // fast path should use pages/chunks in tcache
-  // slow path is regular allocation
 }
 
 static void zialloc_free(void *ptr) {
-  return zialloc::Allocator::instance().free(ptr);
+  zialloc::Allocator::instance().free(ptr);
 }
 
 static void *zialloc_realloc(void *ptr, size_t size) {
-    return zialloc::Allocator::instance().realloc(ptr, size);
+  return zialloc::Allocator::instance().realloc(ptr, size);
 }
 
 static void *zialloc_calloc(size_t nmemb, size_t size) {
-    return zialloc::Allocator::instance().calloc(nmemb, size);
+  return zialloc::Allocator::instance().calloc(nmemb, size);
 }
 
-
-
-// Uncomment and implement these for bonus points
-
-/*
-static void* zialloc_memalign(size_t alignment, size_t size) {
-
-
+static size_t zialloc_usable_size(void *ptr) {
+  return zialloc::memory::heap_usable_size(ptr);
 }
 
-static void* zialloc_aligned_alloc(size_t alignment, size_t size) {
-
+static allocator_stats_t zialloc_snapshot_stats(void) {
+  flush_local_stats_batch();
+  allocator_stats_t snapshot = g_stats;
+  snapshot.alloc_count = g_alloc_count.load(std::memory_order_relaxed);
+  snapshot.free_count = g_free_count.load(std::memory_order_relaxed);
+  snapshot.realloc_count = g_realloc_count.load(std::memory_order_relaxed);
+  snapshot.bytes_allocated = g_bytes_allocated.load(std::memory_order_relaxed);
+  const int64_t in_use = g_bytes_in_use.load(std::memory_order_relaxed);
+  snapshot.bytes_in_use = in_use > 0 ? static_cast<size_t>(in_use) : 0;
+  return snapshot;
 }
-
-static size_t zialloc_usable_size(void* ptr) {
-
-}
-
-static void zialloc_free_sized(void* ptr, size_t size) {
-
-}
-
-static void* zialloc_realloc_array(void* ptr, size_t nmemb, size_t size) {
-
-}
-
-static void zialloc_bulk_free(void** ptrs, size_t count) {
-
-}
-*/
 
 static void zialloc_print_stats(void) {
-  printf("  Allocations:   %lu\n", (unsigned long)g_stats.alloc_count);
-  printf("  Frees:         %lu\n", (unsigned long)g_stats.free_count);
-  printf("  Reallocs:      %lu\n", (unsigned long)g_stats.realloc_count);
-  printf("  Bytes in use:  %zu\n", g_stats.bytes_in_use);
-  printf("  Bytes mapped:  %zu\n", g_stats.bytes_mapped);
-  printf("  mmap calls:    %lu\n", (unsigned long)g_stats.mmap_count);
-  printf("  munmap calls:  %lu\n", (unsigned long)g_stats.munmap_count);
-}
-
-static bool zialloc_validate_heap(void) {
-    // TODO: 
-    //   1. Walk all segments via Heap::instance()
-    //   2. For each segment, check_canary()
-    //   3. For each page, verify used count matches bitmap popcount
-    //   4. Return false if any inconsistency found
-    return true;
+  allocator_stats_t snapshot = zialloc_snapshot_stats();
+  printf("  Allocations:   %lu\n", (unsigned long)snapshot.alloc_count);
+  printf("  Frees:         %lu\n", (unsigned long)snapshot.free_count);
+  printf("  Reallocs:      %lu\n", (unsigned long)snapshot.realloc_count);
+  printf("  Bytes in use:  %zu\n", snapshot.bytes_in_use);
+  printf("  Bytes mapped:  %zu\n", snapshot.bytes_mapped);
+  printf("  mmap calls:    %lu\n", (unsigned long)snapshot.mmap_count);
+  printf("  munmap calls:  %lu\n", (unsigned long)snapshot.munmap_count);
 }
 
 static bool zialloc_get_stats(allocator_stats_t *stats) {
-    // TODO: copy g_stats into *stats
-    if (!stats) return false;
-    *stats = g_stats;
-    return true;
+  if (!stats)
+    return false;
+  *stats = zialloc_snapshot_stats();
+  return true;
+}
+
+static bool zialloc_validate_heap(void) {
+  return zialloc::memory::heap_validate();
 }
 
 static int zialloc_init(void) {
-    // TODO:
-    //   1. If already initialized, return 0
-    //   2. Allocate initial segments via os::alloc_segment() 
-    //      (e.g. 1 small-page segment + 1 medium-page segment)
-    //   3. Initialize Heap::instance() with the segments
-    //   4. Initialize canaries via generate_canary()
-    //   5. Initialize segment keys via Segment::init_key()
-    //   6. Set g_initialized = true
-    //   7. Return 0 on success, -1 on failure
-    if (g_initialized) return 0;
-    // ... your init logic here ...
-    g_initialized = true;
+  if (g_initialized)
     return 0;
+
+  std::memset(&g_stats, 0, sizeof(g_stats));
+  g_alloc_count.store(0, std::memory_order_relaxed);
+  g_free_count.store(0, std::memory_order_relaxed);
+  g_realloc_count.store(0, std::memory_order_relaxed);
+  g_bytes_allocated.store(0, std::memory_order_relaxed);
+  g_bytes_in_use.store(0, std::memory_order_relaxed);
+  g_local_stats = {0, 0, 0, 0, 0, 0};
+
+  const size_t heap_reserved_size = HEAP_RESERVED_DEFAULT;
+  void *reserved_base = zialloc::memory::reserve_region(heap_reserved_size);
+  if (!reserved_base)
+    return -1;
+
+  if (!zialloc::memory::heap_init_reserved(reserved_base, heap_reserved_size))
+    return -1;
+
+  // keep one small/medium/large segment active from start
+  if (!zialloc::memory::heap_add_segment_for_class(PAGE_SM))
+    return -1;
+  if (!zialloc::memory::heap_add_segment_for_class(PAGE_MED))
+    return -1;
+  if (!zialloc::memory::heap_add_segment_for_class(PAGE_LG))
+    return -1;
+
+  g_initialized = true;
+  return 0;
 }
 
 static void zialloc_teardown(void) {
-    // TODO:
-    //   1. Walk all segments, munmap each via os::free_segment()
-    //   2. Reset Heap metadata
-    //   3. Zero out g_stats
-    //   4. Set g_initialized = false
-    g_initialized = false;
+  if (!g_initialized)
+    return;
+  zialloc::memory::heap_clear_metadata();
+  std::memset(&g_stats, 0, sizeof(g_stats));
+  g_alloc_count.store(0, std::memory_order_relaxed);
+  g_free_count.store(0, std::memory_order_relaxed);
+  g_realloc_count.store(0, std::memory_order_relaxed);
+  g_bytes_allocated.store(0, std::memory_order_relaxed);
+  g_bytes_in_use.store(0, std::memory_order_relaxed);
+  g_local_stats = {0, 0, 0, 0, 0, 0};
+  g_initialized = false;
 }
 
 allocator_t zialloc_allocator = {
-    // Required functions
     .malloc = zialloc_malloc,
     .free = zialloc_free,
     .realloc = zialloc_realloc,
     .calloc = zialloc_calloc,
-
-    // Optional functions - set to NULL if not implemented
-    .memalign = NULL,      // zialloc_memalign,
-    .aligned_alloc = NULL, // zialloc_aligned_alloc,
-    .usable_size = NULL,   // zialloc_usable_size,
-    .free_sized = NULL,    // zialloc_free_sized,
-    .realloc_array = NULL, // zialloc_realloc_array,
-    .bulk_free = NULL,     // zialloc_bulk_free,
-
-    // Diagnostics
+    .memalign = NULL,
+    .aligned_alloc = NULL,
+    .usable_size = zialloc_usable_size,
+    .free_sized = NULL,
+    .realloc_array = NULL,
+    .bulk_free = NULL,
     .print_stats = zialloc_print_stats,
     .validate_heap = zialloc_validate_heap,
     .get_stats = zialloc_get_stats,
-
-    // Lifecycle
     .init = zialloc_init,
     .teardown = zialloc_teardown,
-
-    // Metadata 
-    .name = "zialloc",
-    .author = "zia rashid",
-    .version = "0.1.0",
+    .name = "Zialloc",
+    .author = "ZiaRashid",
+    .version = "1.0.0",
     .description = "custom memory allocator",
     .memory_backend = "mmap",
-
-    // Features
     .features =
         {
-            .thread_safe = false,
-            .per_thread_cache = false,
+            .thread_safe = true,
+            .per_thread_cache = true,
             .huge_page_support = false,
             .guard_pages = false,
+            .guard_location = GUARD_NONE,
             .canaries = false,
             .quarantine = false,
             .zero_on_free = false,
-            .min_alignment = MIN_ALIGNMENT,
-            .max_alignment = MAX_ALIGNMENT,
+            .min_alignment = 16,
+            .max_alignment = 16,
         },
 };
 
-
-allocator_t *get_test_allocator(void) { return &zialloc_allocator; }
-
-allocator_t *get_bench_allocator(void) { return &zialloc_allocator; }
+extern "C" allocator_t *get_test_allocator(void) { return &zialloc_allocator; }
+extern "C" allocator_t *get_bench_allocator(void) { return &zialloc_allocator; }
+  

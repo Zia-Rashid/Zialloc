@@ -1,4 +1,6 @@
 // ALLOCATOR_H
+#ifndef ALLOCATOR_H
+#define ALLOCATOR_H
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -89,5 +91,4 @@ typedef struct allocator {
 }
 #endif
 
-
-// ALLOCATOR_H
+#endif // ALLOCATOR_H

@@ -9,8 +9,6 @@
 #define MB      (KB*KB)     // ^      ^ MiB
 #define GB      (MB*KB)     // ^      ^ GiB
 
-#define SMALL_PAGE_SIZE     ( 64*KB)
-#define MEDIUM_PAGE_SIZE    (512*KB)
 #define LARGE_PAGE_SIZE     (  4*MB) 
  
 #define MIN_ALIGNMENT       (64*KB)
@@ -26,18 +24,13 @@
 #define SEGMENT_SIZE        (ZU(1)<<SEGMENT_SHIFT)     // should be 4MiB
 #define SEGMENT_ALIGN       SEGMENT_SIZE
 #define SEGMENT_MASK        ((uintptr_t)(SEGMENT_ALIGN - 1))
+
+#define HEAP_RESERVED_DEFAULT (2ULL * GB)             // ~2 GiB reserved vmem for heap
 #define SMALL_PAGE_SIZE     (ZU(1)<<SMALL_PAGE_SHIFT)
 #define MEDIUM_PAGE_SIZE    (ZU(1)<<MEDIUM_PAGE_SHIFT)
 
-// Check if power of 2
-static inline bool is_power_of_2(size_t n) {
-    uint8_t is{0};
-    while (n) {
-        if (n & 1) { is++; }
-        n = n >> 1;
-    }
-    return is == 1;
+constexpr static inline bool is_power_of_2(size_t n) {
+    return n && !(n & (n - 1));
 }
 
-
-#endif TYPES_H
+#endif // TYPES_H

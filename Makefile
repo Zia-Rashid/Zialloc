@@ -1,5 +1,6 @@
 
 CC       ?= gcc
+CXX      ?= g++
 CFLAGS   := -std=c17 -Wall -Wextra -Wpedantic -Werror
 CFLAGS   += -fno-strict-aliasing
 CFLAGS   += -D_GNU_SOURCE
@@ -20,6 +21,8 @@ endif
 
 LDFLAGS  += -lm -lpthread $(EXTRA_LDFLAGS)
 
+CXXFLAGS := $(filter-out -std=c17,$(CFLAGS)) -std=c++20
+
 TEST_SRCS := src/tests/test_correctness.c \
              src/tests/test_stress.c \
              src/tests/test_edge.c \
@@ -34,16 +37,27 @@ BENCH_SRCS := src/benchmarks/bench_synthetic.c \
 DEFAULT_ALLOC := allocators/glibc/glibc_allocator.c
 
 ALLOCATOR ?= $(DEFAULT_ALLOC)
-
 BUILD_DIR := build
 BIN_DIR   := bin
+
+ZIALLOC_MAIN := allocators/zialloc/alloc.cpp
+ifeq ($(ALLOCATOR),$(ZIALLOC_MAIN))
+ALLOC_CPP_SRCS := allocators/zialloc/alloc.cpp \
+				  allocators/zialloc/free.cpp \
+				  allocators/zialloc/os.cpp \
+				  allocators/zialloc/segments.cpp
+ALLOC_OBJ := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ALLOC_CPP_SRCS))
+LINKER := $(CXX)
+else
+ALLOC_OBJ := $(BUILD_DIR)/allocator.o
+LINKER := $(CC)
+endif
 
 TEST_BIN  := $(BIN_DIR)/run_tests
 BENCH_BIN := $(BIN_DIR)/run_bench
 
 TEST_OBJS  := $(patsubst %.c,$(BUILD_DIR)/%.o,$(TEST_SRCS))
 BENCH_OBJS := $(patsubst %.c,$(BUILD_DIR)/%.o,$(BENCH_SRCS))
-ALLOC_OBJ  := $(BUILD_DIR)/allocator.o
 
 .PHONY: all tests bench clean help run-tests run-bench
 
@@ -54,12 +68,12 @@ tests: $(TEST_BIN)
 bench: $(BENCH_BIN)
 
 $(TEST_BIN): $(TEST_OBJS) $(ALLOC_OBJ) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(LINKER) -o $@ $^ $(LDFLAGS)
 	@echo "Built test runner: $@"
 	@echo "Allocator: $(ALLOCATOR)"
 
 $(BENCH_BIN): $(BENCH_OBJS) $(ALLOC_OBJ) | $(BIN_DIR)
-	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	$(LINKER) -o $@ $^ $(LDFLAGS)
 	@echo "Built benchmark runner: $@"
 	@echo "Allocator: $(ALLOCATOR)"
 
@@ -72,8 +86,14 @@ $(BUILD_DIR)/src/benchmarks/%.o: src/benchmarks/%.c | $(BUILD_DIR)/src/benchmark
 $(BUILD_DIR)/src/harness/%.o: src/harness/%.c | $(BUILD_DIR)/src/harness
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+ifneq ($(ALLOCATOR),$(ZIALLOC_MAIN))
 $(ALLOC_OBJ): $(ALLOCATOR) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
+endif
+
+$(BUILD_DIR)/allocators/zialloc/%.o: allocators/zialloc/%.cpp
+	mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
 
 $(BUILD_DIR):
 	mkdir -p $@
