@@ -23,7 +23,7 @@ typedef struct allocator_features {
   bool per_thread_cache;
   bool huge_page_support;
   bool guard_pages;
-  guard_location_t guard_location; // New field
+  guard_location_t guard_location;
   bool canaries;
   bool quarantine;
   bool zero_on_free;

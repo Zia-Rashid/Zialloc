@@ -239,6 +239,10 @@ static int zialloc_init(void) {
   if (!zialloc::memory::heap_init_reserved(reserved_base, heap_reserved_size))
     return -1;
 
+  // feature toggle: zero-on-free check, default disabled for speed
+  zialloc::memory::set_zero_on_free_enabled(false);
+  zialloc::memory::set_uaf_check_enabled(false);
+
   // keep one small/medium/large segment active from start
   if (!zialloc::memory::heap_add_segment_for_class(PAGE_SM))
     return -1;
@@ -255,6 +259,8 @@ static void zialloc_teardown(void) {
   if (!g_initialized)
     return;
   zialloc::memory::heap_clear_metadata();
+  zialloc::memory::set_zero_on_free_enabled(false);
+  zialloc::memory::set_uaf_check_enabled(false);
   std::memset(&g_stats, 0, sizeof(g_stats));
   g_alloc_count.store(0, std::memory_order_relaxed);
   g_free_count.store(0, std::memory_order_relaxed);

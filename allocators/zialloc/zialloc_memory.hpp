@@ -21,6 +21,8 @@ void unlock_page(void* ptr, size_t size);
 // free-path entry
 void free_dispatch(void* ptr);
 bool free_dispatch_with_size(void* ptr, size_t* usable_size);
+void set_zero_on_free_enabled(bool enabled);
+void set_uaf_check_enabled(bool enabled);
 
 // heap allocation entry
 void* heap_alloc(size_t size);
