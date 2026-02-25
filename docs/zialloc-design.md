@@ -41,6 +41,8 @@ Page
 
 XL allocations bypass the segment/page system and use directly mapped regions that are tracked in `xl_allocs`.
 
+Metadat is stored Out-of-line, zialloc keeps metadata in allocator-owned structures (PageRuntime/Chunk vectors and segment/page structures), and the returned pointer is the raw chunk w/ no inline header. XL allocations are tracked in xl_allocs (which are also out-of-line)
+
 ## Allocation Workflow
 Allocation starts through allocator API wrappers and then `Heap::allocate(size)`.
 

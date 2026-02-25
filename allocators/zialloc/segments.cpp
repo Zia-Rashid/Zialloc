@@ -102,20 +102,6 @@ class Chunk {
 		void mark_free() { in_use = 0; }
 };
 
-class GuardChunk {
-	private:
-		int64_t pattern;
-
-	public:
-		GuardChunk() : pattern(0) {}
-		explicit GuardChunk(int64_t val) : pattern(val) {}
-		void set(int64_t val) { pattern = val; }
-		bool integrity_check(int64_t expected) const {
-			INTEGRITY_CHECK(pattern == expected, "guard mismatch");
-			return true;
-		}
-};
-
 typedef struct tc_page_s {
   Page*       loc;
   page_kind_t kind;
@@ -239,8 +225,6 @@ class Page {
 		uint16_t used;
 		size_t chunk_sz;
 		Chunk* page_start;
-		GuardChunk front_guard;
-		GuardChunk back_guard;
 		page_status_t status;
 		uint64_t prng_state;
 		PageRuntime runtime;
@@ -250,9 +234,9 @@ class Page {
 				: owner_tc(nullptr), owner_tid(0), size_class(PAGE_SM), slot_count(0), is_committed(0),
 					num_committed(0), reserved(0), capacity(0), use_bitmap(true),
 					freelist(), used(0), chunk_sz(0), page_start(nullptr),
-					front_guard(), back_guard(), status(EMPTY), prng_state(0), runtime() {}
+					status(EMPTY), prng_state(0), runtime() {}
 
-		bool init(void* base, page_kind_t kind, size_t chunk_size, int64_t canary) {
+		bool init(void* base, page_kind_t kind, size_t chunk_size) {
 			if (!base || chunk_size == 0)
 				return false;
 
@@ -277,8 +261,6 @@ class Page {
 			chunk_sz = runtime.chunk_size;
 			status = EMPTY;
 			prng_state = generate_canary();
-			front_guard.set(canary);
-			back_guard.set(canary);
 
 			runtime.chunks.clear();
 			runtime.freelist.clear();
@@ -485,7 +467,7 @@ class Segment {
 			return &slots[idx];
 		}
 
-		void* allocate(size_t req, int64_t guard_canary) {
+		void* allocate(size_t req) {
 			if (slots.empty())
 				return nullptr;
 			size_t start = 0;
@@ -502,7 +484,7 @@ class Segment {
 					std::lock_guard<std::mutex> page_lk(page_lock_for(&page));
 					if (!page.is_initialized()) {
 						void* pbase = static_cast<void*>(static_cast<char*>(runtime.base) + (i * runtime.page_size));
-						if (!page.init(pbase, size_class, req, guard_canary))
+						if (!page.init(pbase, size_class, req))
 							continue;
 					}
 					if (!page.can_hold(req))
@@ -580,7 +562,6 @@ private:
   memkind_t mem_kind;
   uint64_t canary;
   size_t reserved_cursor;
-  int64_t guard_seed;
   std::mutex heap_mu;
 
   bool add_segment_nolock(void* segment_base, segment_kind_t kind, page_kind_t page_kind) {
@@ -618,7 +599,7 @@ private:
         seg_kind(), seg_bases(), seg_page_kind(), seg_index_by_base(),
         xl_allocs(),
         mem_kind(MEM_NONE), canary(0),
-        reserved_cursor(0), guard_seed(0) {}
+        reserved_cursor(0) {}
   ~Heap() = default;
 
 public:
@@ -635,7 +616,6 @@ public:
     reserved_size = size;
     reserved_cursor = 0;
     canary = generate_canary();
-    guard_seed = static_cast<int64_t>(canary);
     mem_kind = MEM_OS;
     size_t cap = size / SEGMENT_SIZE;
     layout.reserve(cap);
@@ -738,7 +718,7 @@ public:
       size_t preferred_idx = 0;
       if (tc->get_active() && tc->get_preferred_segment(kind, &preferred_idx) &&
           preferred_idx < layout.size() && seg_page_kind[preferred_idx] == kind) {
-        void* ptr = layout[preferred_idx].allocate(need, guard_seed);
+        void* ptr = layout[preferred_idx].allocate(need);
         if (ptr) {
           Page* page = layout[preferred_idx].find_page_for(ptr);
           if (page) {
@@ -750,7 +730,7 @@ public:
       for (size_t i = 0; i < layout.size(); ++i) {
         if (seg_page_kind[i] != kind)
           continue;
-        void* ptr = layout[i].allocate(need, guard_seed);
+        void* ptr = layout[i].allocate(need);
         if (ptr) {
           if (tc->get_active()) {
             tc->set_preferred_segment(kind, i);
@@ -770,7 +750,7 @@ public:
         if (tc->get_active()) {
           tc->set_preferred_segment(kind, layout.size() - 1);
         }
-        void* ptr = layout.back().allocate(need, guard_seed);
+        void* ptr = layout.back().allocate(need);
         if (ptr) {
           Page* page = layout.back().find_page_for(ptr);
           if (page) {
@@ -793,7 +773,7 @@ public:
       if (tc->get_active()) {
         tc->set_preferred_segment(kind, layout.size() - 1);
       }
-      void* ptr = layout.back().allocate(need, guard_seed);
+      void* ptr = layout.back().allocate(need);
       if (ptr) {
         Page* page = layout.back().find_page_for(ptr);
         if (page) {
@@ -925,7 +905,6 @@ public:
     canary = 0;
     mem_kind = MEM_NONE;
     reserved_cursor = 0;
-    guard_seed = 0;
   }
 };
 
