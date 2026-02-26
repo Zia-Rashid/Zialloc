@@ -28,7 +28,7 @@ struct LocalStatsBatch {
 };
 
 static thread_local LocalStatsBatch g_local_stats{0, 0, 0, 0, 0, 0};
-static constexpr uint32_t STATS_FLUSH_INTERVAL = 256;
+static constexpr uint32_t STATS_FLUSH_INTERVAL = 1024;
 
 static inline void flush_local_stats_batch() {
   if (g_local_stats.alloc_count) {
@@ -103,7 +103,10 @@ void *Allocator::malloc(size_t size) {
   if (!ptr)
     return nullptr;
 
-  size_t usable = memory::heap_usable_size(ptr);
+  size_t usable = memory::heap_last_alloc_usable();
+  if (usable == 0) {
+    usable = memory::heap_usable_size(ptr);
+  }
   g_local_stats.alloc_count++;
   g_local_stats.bytes_allocated += size;
   g_local_stats.bytes_in_use_delta += static_cast<int64_t>(usable);

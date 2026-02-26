@@ -26,6 +26,7 @@ void set_uaf_check_enabled(bool enabled);
 
 // heap allocation entry
 void* heap_alloc(size_t size);
+size_t heap_last_alloc_usable();
 size_t heap_usable_size(void* ptr);
 bool heap_validate();
 bool heap_add_segment_for_class(page_kind_t kind);

@@ -21,8 +21,10 @@ static std::atomic<bool> g_uaf_check{false};
 
 static constexpr size_t PAGE_LOCK_STRIPES = 2048;
 static constexpr size_t MAX_QUEUE_PROBES_PER_ALLOC = 64;
-static constexpr size_t MAX_FALLBACK_SCANS_PER_ALLOC = 128;
+static constexpr size_t MAX_FALLBACK_SCANS_PER_ALLOC = 128;	// max segments that will be checked on slow path
 static std::array<std::mutex, PAGE_LOCK_STRIPES> g_page_locks;
+static thread_local size_t g_last_alloc_usable = 0;
+static std::atomic<uint32_t> g_live_threads{0};
 
 static inline page_kind_t class_for_size(size_t size) {
   if (size <= CHUNK_SM)
@@ -48,8 +50,8 @@ static inline size_t ceil_pow2_at_least_16(size_t n) {
   return static_cast<size_t>(1ULL << shift);
 }
 
-static inline size_t normalize_chunk_request(page_kind_t kind, size_t req) {
-  // Bucket only small/medium classes to reduce page-size fragmentation scans.
+static inline size_t norm_chunk_req(page_kind_t kind, size_t req) {
+  // bucket only small/medium classes to reduce page-sized fragmentation scans
   if (kind != PAGE_SM && kind != PAGE_MED)
     return align_up(req, 16);
   size_t norm = ceil_pow2_at_least_16(req);
@@ -76,9 +78,9 @@ static constexpr uint32_t CHUNK_MAGIC = 0xC47A110CU;
 static constexpr uint64_t XL_MAGIC = 0x584C4F43484B4559ULL; // "XLOCHKEY"
 
 struct ChunkHeader {
-  Page*			owner;
-  uint32_t 	slot;
-  uint32_t 	magic;
+  Page *owner;
+  uint32_t slot;
+  uint32_t magic;
 };
 
 struct XLHeader {
@@ -88,7 +90,6 @@ struct XLHeader {
   uint64_t 	reserved;
 };
 
-// comm
 class DeferredRing {
 private:
   static constexpr uint32_t CAP = 256;
@@ -111,7 +112,6 @@ public:
     }
   }
 
-	// comm
   bool push(void *ptr) {
     uint32_t pos = head.load(std::memory_order_relaxed);
     for (;;) {
@@ -133,7 +133,6 @@ public:
     }
   }
 
-	//comm
   bool pop(void **out) {
     uint32_t pos = tail.load(std::memory_order_relaxed);
     for (;;) {
@@ -155,7 +154,6 @@ public:
     }
   }
 
-	// comm
   size_t approx_size() const {
     const uint32_t h = head.load(std::memory_order_relaxed);
     const uint32_t t = tail.load(std::memory_order_relaxed);
@@ -224,7 +222,6 @@ private:
     return slot_user_ptr(hdr->slot) == ptr;
   }
 
-	// comm
   void drain_deferred_locked(size_t max_to_drain) { 
     size_t drained = 0;
     void *deferred_ptr = nullptr;
@@ -248,20 +245,20 @@ public:
     owner_segment_idx = seg_idx;
   }
 
-  bool init(void *page_base, page_kind_t kind, size_t requested_size) {
-    if (!page_base || requested_size == 0)
+  bool init(void *page_base, page_kind_t kind, size_t req_sz) {
+    if (!page_base || req_sz == 0)
       return false;
 
     const size_t span = page_size_for_kind(kind);
     size_t stride = 0;
     size_t cap = 0;
     if (kind == PAGE_LG) {
-      // Keep large class geometry fixed: one chunk per 4MiB page.
-      // This avoids retuning/reinitializing metadata on every varying large request.
+      // keep large class geometry fixed: one chunk per 4MiB page
+      // avoids reinitializing metadata on every varying large request
       stride = span;
       cap = 1;
     } else {
-      const size_t norm_req = normalize_chunk_request(kind, requested_size);
+      const size_t norm_req = norm_chunk_req(kind, req_sz);
       stride = align_up(norm_req + sizeof(ChunkHeader), 16);
       if (stride == 0)
         return false;
@@ -286,15 +283,15 @@ public:
     return true;
   }
 
-  bool retune_if_empty(size_t requested_size) {
+  bool retune_if_empty(size_t req_sz) {
     if (!initialized)
       return false;
     if (used != 0)
       return false;
-    if (requested_size == 0)
+    if (req_sz == 0)
       return false;
-    // Keep same page base and class; only retune chunk geometry.
-    return init(base, size_class, requested_size);
+    // keep same page base and class - only retune chunk geometry(size)
+    return init(base, size_class, req_sz);
   }
 
   bool is_initialized() const { return initialized; }
@@ -325,12 +322,12 @@ public:
     if (words == 0)
       return nullptr;
 
-    uint32_t word_idx = start >> 6;			// div by 64
+    uint32_t word_idx = start >> 6; // div by 64 bitmap idx
     const uint32_t start_word = word_idx;
     for (;;) {
       uint64_t word = used_bitmap[word_idx];
       if (~word != 0ULL) {
-        uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(~word)); // counts num of zeroes to right of first 1.
+        uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(~word));
         uint32_t slot = (word_idx << 6) + bit;
         if (slot < capacity) {
           bit_set(slot);
@@ -349,7 +346,7 @@ public:
           return slot_user_ptr(slot);
         }
       }
-      word_idx = (word_idx + 1) % words;		// comm
+      word_idx = (word_idx + 1) % words;
       if (word_idx == start_word)
         break;
     }
@@ -359,7 +356,6 @@ public:
     return nullptr;
   }
 
-	// comm 
   bool free_local(void *ptr, size_t *usable_out, page_status_t *before,
                   page_status_t *after) {
     if (!contains_ptr(ptr))
@@ -372,7 +368,7 @@ public:
     *before = status;
     const uint32_t slot = hdr->slot;
     if (!bit_is_set(slot))
-      std::abort(); // double-free detected // TODO: make a macro for this
+      std::abort();
 
     if (g_zero_on_free.load(std::memory_order_relaxed)) {
       std::memset(ptr, 0, chunk_usable);
@@ -391,7 +387,6 @@ public:
     return true;
   }
 
-	// comm
   bool enqueue_deferred_free(void *ptr, size_t *usable_out) {
     if (!contains_ptr(ptr))
       return false;
@@ -504,9 +499,8 @@ public:
 
   bool try_mark_enqueued() {
     bool expected = false;
-    return queued_non_full.
-						compare_exchange_strong(expected, true,
-											std::memory_order_acq_rel, std::memory_order_relaxed); // prod/cons design
+    return queued_non_full.compare_exchange_strong(
+        expected, true, std::memory_order_acq_rel, std::memory_order_relaxed);
   }
 
   void clear_enqueued() { queued_non_full.store(false, std::memory_order_release); }
@@ -516,6 +510,7 @@ public:
       return nullptr;
     if (!can_hold_request(req))
       return nullptr;
+    const bool mt = g_live_threads.load(std::memory_order_relaxed) > 1;
 
     const size_t start = next_candidate_idx.load(std::memory_order_relaxed) % page_count;
     for (size_t step = 0; step < page_count; ++step) {
@@ -524,7 +519,7 @@ public:
       void *out = nullptr;
       page_status_t before = EMPTY;
       page_status_t after = EMPTY;
-      {
+      if (mt) {
         std::lock_guard<std::mutex> lk(page_lock_for(&page));
         const size_t target_req =
             (size_class != PAGE_LG && fixed_chunk_set.load(std::memory_order_relaxed))
@@ -546,6 +541,27 @@ public:
         }
 
         out = page.allocate(req, &before, &after); // dispatch to page lvl alloc
+      } else {
+        const size_t target_req =
+            (size_class != PAGE_LG && fixed_chunk_set.load(std::memory_order_relaxed))
+                ? fixed_chunk_usable.load(std::memory_order_relaxed)
+                : req;
+        if (!page.is_initialized()) {
+          void *page_base = static_cast<void *>(static_cast<char *>(base) + idx * page_size);
+          if (!page.init(page_base, size_class, target_req))
+            continue;
+          if (size_class != PAGE_LG &&
+              !fixed_chunk_set.load(std::memory_order_relaxed)) {
+            fixed_chunk_usable.store(page.get_chunk_usable(), std::memory_order_relaxed);
+            fixed_chunk_set.store(true, std::memory_order_relaxed);
+          }
+        }
+        if (!page.can_hold(req)) {
+          if (size_class != PAGE_LG || !page.retune_if_empty(req) || !page.can_hold(req))
+            continue;
+        }
+
+        out = page.allocate(req, &before, &after);
       }
 
       if (!out)
@@ -569,9 +585,12 @@ public:
     if (!page)
       return false;
 
+    const bool mt = g_live_threads.load(std::memory_order_relaxed) > 1;
     bool ok = false;
-    {
+    if (mt) {
       std::lock_guard<std::mutex> lk(page_lock_for(page));
+      ok = page->free_local(ptr, usable_out, before, after);
+    } else {
       ok = page->free_local(ptr, usable_out, before, after);
     }
     if (!ok)
@@ -584,16 +603,13 @@ public:
   }
 };
 
-
-// comm
 typedef struct tc_page_s {
-  Page*				loc;
+  Page *loc;
   page_kind_t kind;
-  size_t 			size;
-  void*				freelist;
+  size_t size;
+  void *freelist;
 } tc_page_t;
 
-//comm
 class ThreadCache {
 private:
   static std::atomic<uint32_t> live_threads;
@@ -613,9 +629,13 @@ public:
         cached_page_ends{0, 0, 0}, preferred_seg_idx{0, 0, 0},
         preferred_seg_valid{false, false, false} {
     live_threads.fetch_add(1, std::memory_order_relaxed);
+    g_live_threads.fetch_add(1, std::memory_order_relaxed);
   }
 
-  ~ThreadCache() { live_threads.fetch_sub(1, std::memory_order_relaxed); }
+  ~ThreadCache() {
+    live_threads.fetch_sub(1, std::memory_order_relaxed);
+    g_live_threads.fetch_sub(1, std::memory_order_relaxed);
+  }
 
   static ThreadCache *current() {
     static thread_local ThreadCache instance;
@@ -672,6 +692,7 @@ public:
     preferred_seg_idx[idx] = seg_idx;
     preferred_seg_valid[idx] = true;
   }
+
 };
 
 std::atomic<uint32_t> ThreadCache::live_threads{0};
@@ -759,7 +780,6 @@ private:
     return add_segment_nolock(seg_base, kind, page_kind);
   }
 
-	//comm
   void *alloc_xl(size_t size) {
     if (size >= (SIZE_MAX - 4096))
       return nullptr;
@@ -777,6 +797,7 @@ private:
     hdr->mapping_size = map_size;
     hdr->usable_size = map_size - sizeof(XLHeader);
     hdr->reserved = 0;
+    g_last_alloc_usable = hdr->usable_size;
 
     return static_cast<void *>(reinterpret_cast<char *>(raw) + sizeof(XLHeader));
   }
@@ -835,7 +856,6 @@ public:
     seg_bases.reserve(cap);
     seg_page_kind.reserve(cap);
 
-		// comm
     for (ClassShard &shard : class_shards) {
       std::lock_guard<std::mutex> shard_lk(shard.mu);
       shard.segments.clear();
@@ -856,12 +876,13 @@ public:
   }
 
   void *allocate(size_t size) {
+    g_last_alloc_usable = 0;
     ThreadCache *tc = ThreadCache::current();
     const bool mt = ThreadCache::is_multi_threaded();
 
     page_kind_t kind = class_for_size(size);
     if (kind == PAGE_XL) {
-      // Keep <= 4MiB-in-page requests off XL mmap path.
+      // goto xl path?
       const size_t large_fit_limit = LARGE_PAGE_SIZE - sizeof(ChunkHeader);
       if (size <= large_fit_limit) {
         kind = PAGE_LG;
@@ -872,7 +893,7 @@ public:
 
     const size_t need = align_up(size, 16);
 
-    // ideal path
+    // ideal path - try thread-local cached page first
     if (tc->get_active()) {
       Page *cached = tc->get_cached_page(kind);
       if (cached) {
@@ -892,12 +913,13 @@ public:
           else
             tc->clear_cached_page(kind, cached);
         }
-        if (fast)
+        if (fast) {
+          g_last_alloc_usable = cached->get_chunk_usable();
           return fast;
+        }
       }
     }
 
-		// comm
     auto try_segment = [&](size_t seg_idx) -> void * {
       if (seg_idx >= layout.size())
         return nullptr;
@@ -912,14 +934,17 @@ public:
       if (seg->has_free_pages() && seg->can_hold_request(need))
         enqueue_non_full_segment(kind, seg_idx);
 
-      if (!ptr)
+      if (!ptr) {
         return nullptr;
+      }
 
       if (tc->get_active()) {
         tc->set_preferred_segment(kind, seg_idx);
         if (page)
           tc->cache_page(kind, page, page->get_base_addr(), page->get_span_size());
       }
+      if (page)
+        g_last_alloc_usable = page->get_chunk_usable();
       return ptr;
     };
 
@@ -931,8 +956,7 @@ public:
       }
     }
 
-    // non full segment queue per size class
-		// comm
+    // shard queue of known non-full segments
     {
       ClassShard &shard = shard_for(kind);
       size_t probes = 0;
@@ -959,7 +983,7 @@ public:
       }
     }
 
-    // slow path
+    // snapshot all segments in class and try a subset
     std::vector<size_t> candidates;
     {
       ClassShard &shard = shard_for(kind);
@@ -976,7 +1000,7 @@ public:
         return ptr;
     }
 
-    // stupid slow path
+    // grow from reserved heap (ideal) instead of mmaping more mem to expand.
     {
       std::lock_guard<std::mutex> lk(heap_mu);
       if (add_segment_from_reserved_nolock(SEGMENT_NORM, kind)) {
@@ -998,14 +1022,14 @@ public:
     }
   }
 
-	// comm 
   bool free_ptr(void *ptr, size_t *usable_out) {
     if (!ptr)
       return true;
 
     ThreadCache *tc = ThreadCache::current();
 
-    ChunkHeader *chdr = reinterpret_cast<ChunkHeader *>(static_cast<char *>(ptr) - sizeof(ChunkHeader));
+    ChunkHeader *chdr = reinterpret_cast<ChunkHeader *>(
+        static_cast<char *>(ptr) - sizeof(ChunkHeader));
     if (chdr->magic == CHUNK_MAGIC && chdr->owner) {
       Page *page = chdr->owner;
       Segment *seg = page->get_owner_segment();
@@ -1055,10 +1079,10 @@ public:
     if (!ptr)
       return 0;
 
-    ChunkHeader *chdr = reinterpret_cast<ChunkHeader *>(static_cast<char *>(ptr) - sizeof(ChunkHeader));
-    if (chdr->magic == CHUNK_MAGIC && chdr->owner) {
+    ChunkHeader *chdr = reinterpret_cast<ChunkHeader *>(
+        static_cast<char *>(ptr) - sizeof(ChunkHeader));
+    if (chdr->magic == CHUNK_MAGIC && chdr->owner)
       return chdr->owner->usable_size(ptr);
-    }
 
     return usable_xl(ptr);
   }
@@ -1138,6 +1162,8 @@ bool heap_add_segment_for_class(page_kind_t kind) {
 }
 
 void *heap_alloc(size_t size) { return HeapState::instance().allocate(size); }
+
+size_t heap_last_alloc_usable() { return g_last_alloc_usable; }
 
 size_t heap_usable_size(void *ptr) { return HeapState::instance().usable_size(ptr); }
 
