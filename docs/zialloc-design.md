@@ -10,10 +10,10 @@ Zialloc uses fixed size classes for regular allocations plus a direct-mapped XL 
 - Page classes: small (64KiB), medium (512KiB), large (4MiB), XL (direct OS mapping)
 - Chunk size thresholds used for class selection: `0x7800` (small), `0x3C000` (medium), `0x1FFF00` (large), above-threshold is XL
 
-Regular (non-XL) chunk sizes are aligned to 16 bytes before placement.
+Regular sized chunks are aligned to 16 byte boundaries before being placed
 
 ## Heap Layout
-At init, Zialloc reserves a large virtual region (w/ `reserve_region`) and commits segments from it on demand (w/ `commit_region`). It immediately seeds one segment each for small, medium, and large classes.
+At init, zialloc reserves a large vmmem region (w/ `reserve_region`) and commits segments from it on demand (w/ `commit_region`). It immediately seeds one segment each for small, medium, and large classes.
 
 High-level layout:
 
