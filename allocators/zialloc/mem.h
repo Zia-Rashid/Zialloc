@@ -99,9 +99,13 @@ typedef enum page_status_e { FULL, ACTIVE, EMPTY } page_status_t;
 // Compute usable = P - overhead
 // Set max_chunk = floor(usable / 2)
 typedef enum chunk_max_e {
-  CHUNK_SM = 0x7800,   // (30 KiB)     aligned + ensures we can fit <= 2 chunks.
-  CHUNK_MD = 0x3C000,  // (240 KiB)
-  CHUNK_LG = 0x1FFF00, // (2047 KiB)
+  // Increase small/medium qualifying limits so more requests stay in class
+  // fast paths before spilling to larger classes.
+  CHUNK_SM = 0x7800,   // (30 KiB)
+  CHUNK_MD = 0x60000,  // (384 KiB)
+  // large class targets a fixed one-slot 4MiB page path, so allow requests
+  // up to nearly a full large page before falling back to XL mapping.
+  CHUNK_LG = 0x3FFF00, // (4095 KiB)
   CHUNK_XL             // whatever it wants to be
 } chunk_max_t;
 

@@ -3,10 +3,9 @@
 #include <cstdint>
 #include <atomic>
 #include <cstring>
+#include <deque>
 #include <memory>
-#include <memory_resource>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 
 #include "types.h"
@@ -19,10 +18,11 @@ namespace {
 
 static std::atomic<bool> g_zero_on_free{false};
 static std::atomic<bool> g_uaf_check{false};
+
 static constexpr size_t PAGE_LOCK_STRIPES = 2048;
-static constexpr size_t SEG_LOCK_STRIPES = 512;
+static constexpr size_t MAX_QUEUE_PROBES_PER_ALLOC = 64;
+static constexpr size_t MAX_FALLBACK_SCANS_PER_ALLOC = 128;
 static std::array<std::mutex, PAGE_LOCK_STRIPES> g_page_locks;
-static std::array<std::mutex, SEG_LOCK_STRIPES> g_seg_locks;
 
 static inline page_kind_t class_for_size(size_t size) {
   if (size <= CHUNK_SM)
@@ -38,547 +38,710 @@ static inline size_t page_size_for_kind(page_kind_t kind) {
   return page_kind_size(kind);
 }
 
-struct PageRuntime {
-  void *base;
-  size_t chunk_size;
-  size_t capacity;
-  size_t used;
-  std::vector<Chunk> chunks;
-  std::vector<uint32_t> freelist;
-  std::shared_ptr<std::array<std::byte, 2048>> deferred_buf;
-  std::shared_ptr<std::pmr::monotonic_buffer_resource> deferred_res;
-  std::shared_ptr<std::pmr::vector<void*>> deferred_frees;
-  bool initialized;
+static inline size_t ceil_pow2_at_least_16(size_t n) {
+  if (n <= 16)
+    return 16;
+  const size_t x = n - 1;
+  const unsigned lz =
+      static_cast<unsigned>(__builtin_clzll(static_cast<unsigned long long>(x)));
+  const unsigned shift = 64U - lz;
+  return static_cast<size_t>(1ULL << shift);
+}
 
-  PageRuntime()
-      : base(nullptr), chunk_size(0), capacity(0), used(0),
-        deferred_buf(), deferred_res(), deferred_frees(), initialized(false) {}
-};
+static inline size_t normalize_chunk_request(page_kind_t kind, size_t req) {
+  // Bucket only small/medium classes to reduce page-size fragmentation scans.
+  if (kind != PAGE_SM && kind != PAGE_MED)
+    return align_up(req, 16);
+  size_t norm = ceil_pow2_at_least_16(req);
+  const size_t cap = (kind == PAGE_SM) ? static_cast<size_t>(CHUNK_SM)
+                                       : static_cast<size_t>(CHUNK_MD);
+  if (norm > cap)
+    norm = cap;
+  return align_up(norm, 16);
+}
 
-struct SegmentRuntime {
-  void *base;
-  page_kind_t page_kind;
-  size_t page_size;
-  size_t page_count;
-  std::vector<PageRuntime> pages;
-
-  SegmentRuntime()
-      : base(nullptr), page_kind(PAGE_SM), page_size(0), page_count(0), pages() {}
-};
-
-} // namespace
-
-class Page;
-class Segment;
-class Heap;
-
-static inline std::mutex& page_lock_for(const Page* page) {
-  const uintptr_t key = reinterpret_cast<uintptr_t>(page) >> 4;
+static inline std::mutex &page_lock_for(const void *page_like_ptr) {
+  const uintptr_t key = reinterpret_cast<uintptr_t>(page_like_ptr) >> 4;
   return g_page_locks[key % PAGE_LOCK_STRIPES];
 }
 
-static inline std::mutex& segment_lock_for(const Segment* seg) {
-  const uintptr_t key = reinterpret_cast<uintptr_t>(seg) >> 4;
-  return g_seg_locks[key % SEG_LOCK_STRIPES];
+static inline size_t class_index_for_kind(page_kind_t kind) {
+  return static_cast<size_t>(kind);
 }
 
-class Chunk {
-	private:
-		Page* page;
-		uint32_t data_size : 31;
-		uint32_t in_use    : 1;
-		void* data;
+class Page;
+class Segment;
 
-	public:
-		Chunk() : page(nullptr), data_size(0), in_use(0), data(nullptr) {}
-		Chunk(Page* owning_page, void* data_ptr, size_t size)
-			: page(owning_page), data_size(static_cast<uint32_t>(size)), in_use(0), data(data_ptr) {}
+static constexpr uint32_t CHUNK_MAGIC = 0xC47A110CU;
+static constexpr uint64_t XL_MAGIC = 0x584C4F43484B4559ULL; // "XLOCHKEY"
 
-		Page* get_page() const { return page; }
-		bool is_in_use() const { return in_use != 0; }
-		void* get_data() const { return data; }
-		size_t get_data_size() const { return data_size; }
-		void mark_used() { in_use = 1; }
-		void mark_free() { in_use = 0; }
+struct ChunkHeader {
+  Page*			owner;
+  uint32_t 	slot;
+  uint32_t 	magic;
 };
 
+struct XLHeader {
+  uint64_t 	magic;
+  size_t 		mapping_size;
+  size_t 		usable_size;
+  uint64_t 	reserved;
+};
+
+// comm
+class DeferredRing {
+private:
+  static constexpr uint32_t CAP = 256;
+  static constexpr uint32_t MASK = CAP - 1;
+
+  struct Cell {
+    std::atomic<uint32_t> seq;
+    void *data;
+  };
+
+  std::array<Cell, CAP> cells;
+  std::atomic<uint32_t> head;
+  std::atomic<uint32_t> tail;
+
+public:
+  DeferredRing() : cells(), head(0), tail(0) {
+    for (uint32_t i = 0; i < CAP; ++i) {
+      cells[i].seq.store(i, std::memory_order_relaxed);
+      cells[i].data = nullptr;
+    }
+  }
+
+	// comm
+  bool push(void *ptr) {
+    uint32_t pos = head.load(std::memory_order_relaxed);
+    for (;;) {
+      Cell &cell = cells[pos & MASK];
+      const uint32_t seq = cell.seq.load(std::memory_order_acquire);
+      const intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+      if (diff == 0) {
+        if (head.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+          cell.data = ptr;
+          cell.seq.store(pos + 1, std::memory_order_release);
+          return true;
+        }
+      } else if (diff < 0) {
+        return false;
+      } else {
+        pos = head.load(std::memory_order_relaxed);
+      }
+    }
+  }
+
+	//comm
+  bool pop(void **out) {
+    uint32_t pos = tail.load(std::memory_order_relaxed);
+    for (;;) {
+      Cell &cell = cells[pos & MASK];
+      const uint32_t seq = cell.seq.load(std::memory_order_acquire);
+      const intptr_t dif = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
+      if (dif == 0) {
+        if (tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed,
+                                       std::memory_order_relaxed)) {
+          *out = cell.data;
+          cell.seq.store(pos + CAP, std::memory_order_release);
+          return true;
+        }
+      } else if (dif < 0) {
+        return false;
+      } else {
+        pos = tail.load(std::memory_order_relaxed);
+      }
+    }
+  }
+
+	// comm
+  size_t approx_size() const {
+    const uint32_t h = head.load(std::memory_order_relaxed);
+    const uint32_t t = tail.load(std::memory_order_relaxed);
+    return static_cast<size_t>(h - t);
+  }
+};
+
+class Page {
+private:
+  Segment *owner_segment;
+  size_t owner_segment_idx;
+  void *base;
+  page_kind_t size_class;
+  size_t page_span;
+  size_t chunk_stride;
+  size_t chunk_usable;
+  uint32_t capacity;
+  uint32_t used;
+  uint32_t first_hint;
+  pid_t owner_tid;
+  page_status_t status;
+  bool initialized;
+  std::vector<uint64_t> used_bitmap;
+  DeferredRing deferred_frees;
+
+  ChunkHeader *slot_header(uint32_t slot) const {
+    return reinterpret_cast<ChunkHeader *>(static_cast<char *>(base) +
+                                           static_cast<size_t>(slot) * chunk_stride);
+  }
+
+  void *slot_user_ptr(uint32_t slot) const {
+    return static_cast<void *>(reinterpret_cast<char *>(slot_header(slot)) + sizeof(ChunkHeader));
+  }
+
+  ChunkHeader *user_to_header(void *ptr) const {
+    return reinterpret_cast<ChunkHeader *>(static_cast<char *>(ptr) - sizeof(ChunkHeader));
+  }
+
+  bool bit_is_set(uint32_t idx) const {
+    const uint32_t word = idx >> 6;
+    const uint32_t bit = idx & 63U;
+    return (used_bitmap[word] & (1ULL << bit)) != 0;
+  }
+
+  void bit_set(uint32_t idx) {
+    const uint32_t word = idx >> 6;
+    const uint32_t bit = idx & 63U;
+    used_bitmap[word] |= (1ULL << bit);
+  }
+
+  void bit_clear(uint32_t idx) {
+    const uint32_t word = idx >> 6;
+    const uint32_t bit = idx & 63U;
+    used_bitmap[word] &= ~(1ULL << bit);
+  }
+
+  bool validate_header(void *ptr, ChunkHeader *hdr) const {
+    if (!hdr)
+      return false;
+    if (hdr->magic != CHUNK_MAGIC)
+      return false;
+    if (hdr->owner != this)
+      return false;
+    if (hdr->slot >= capacity)
+      return false;
+    return slot_user_ptr(hdr->slot) == ptr;
+  }
+
+	// comm
+  void drain_deferred_locked(size_t max_to_drain) { 
+    size_t drained = 0;
+    void *deferred_ptr = nullptr;
+    while (drained < max_to_drain && deferred_frees.pop(&deferred_ptr)) {
+      page_status_t before = EMPTY;
+      page_status_t after = EMPTY;
+      (void)free_local(deferred_ptr, nullptr, &before, &after);
+      drained++;
+    }
+  }
+
+public:
+  Page()
+      : owner_segment(nullptr), owner_segment_idx(0), base(nullptr), size_class(PAGE_SM),
+        page_span(0), chunk_stride(0), chunk_usable(0), capacity(0), used(0),
+        first_hint(0), owner_tid(0), status(EMPTY), initialized(false), used_bitmap(),
+        deferred_frees() {}
+
+  void set_owner_segment(Segment *seg, size_t seg_idx) {
+    owner_segment = seg;
+    owner_segment_idx = seg_idx;
+  }
+
+  bool init(void *page_base, page_kind_t kind, size_t requested_size) {
+    if (!page_base || requested_size == 0)
+      return false;
+
+    const size_t span = page_size_for_kind(kind);
+    size_t stride = 0;
+    size_t cap = 0;
+    if (kind == PAGE_LG) {
+      // Keep large class geometry fixed: one chunk per 4MiB page.
+      // This avoids retuning/reinitializing metadata on every varying large request.
+      stride = span;
+      cap = 1;
+    } else {
+      const size_t norm_req = normalize_chunk_request(kind, requested_size);
+      stride = align_up(norm_req + sizeof(ChunkHeader), 16);
+      if (stride == 0)
+        return false;
+      cap = span / stride;
+    }
+    if (cap == 0 || cap > UINT32_MAX)
+      return false;
+
+    base = page_base;
+    size_class = kind;
+    page_span = span;
+    chunk_stride = stride;
+    chunk_usable = stride - sizeof(ChunkHeader);
+    capacity = static_cast<uint32_t>(cap);
+    used = 0;
+    first_hint = 0;
+    owner_tid = 0;
+    status = EMPTY;
+    initialized = true;
+
+    used_bitmap.assign((capacity + 63U) / 64U, 0);
+    return true;
+  }
+
+  bool retune_if_empty(size_t requested_size) {
+    if (!initialized)
+      return false;
+    if (used != 0)
+      return false;
+    if (requested_size == 0)
+      return false;
+    // Keep same page base and class; only retune chunk geometry.
+    return init(base, size_class, requested_size);
+  }
+
+  bool is_initialized() const { return initialized; }
+  bool can_hold(size_t req) const { return initialized && req <= chunk_usable; }
+  bool has_free() const { return initialized && used < capacity; }
+  bool is_full() const { return initialized && used == capacity; }
+
+  bool contains_ptr(void *ptr) const {
+    if (!initialized || !ptr)
+      return false;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    return p >= b && p < (b + page_span);
+  }
+
+  void *allocate(size_t req, page_status_t *before, page_status_t *after) {
+    if (!can_hold(req) || used == capacity)
+      return nullptr;
+
+    if (deferred_frees.approx_size() >= 32) {
+      drain_deferred_locked(16);
+    }
+
+    *before = status;
+
+    const uint32_t start = first_hint;
+    const uint32_t words = static_cast<uint32_t>(used_bitmap.size());
+    if (words == 0)
+      return nullptr;
+
+    uint32_t word_idx = start >> 6;			// div by 64
+    const uint32_t start_word = word_idx;
+    for (;;) {
+      uint64_t word = used_bitmap[word_idx];
+      if (~word != 0ULL) {
+        uint32_t bit = static_cast<uint32_t>(__builtin_ctzll(~word)); // counts num of zeroes to right of first 1.
+        uint32_t slot = (word_idx << 6) + bit;
+        if (slot < capacity) {
+          bit_set(slot);
+          used++;
+          first_hint = slot;
+          if (owner_tid == 0)
+            owner_tid = current_tid();
+          status = (used == capacity) ? FULL : ACTIVE;
+
+          ChunkHeader *hdr = slot_header(slot);
+          hdr->owner = this;
+          hdr->slot = slot;
+          hdr->magic = CHUNK_MAGIC;
+
+          *after = status;
+          return slot_user_ptr(slot);
+        }
+      }
+      word_idx = (word_idx + 1) % words;		// comm
+      if (word_idx == start_word)
+        break;
+    }
+
+    status = FULL;
+    *after = status;
+    return nullptr;
+  }
+
+	// comm 
+  bool free_local(void *ptr, size_t *usable_out, page_status_t *before,
+                  page_status_t *after) {
+    if (!contains_ptr(ptr))
+      return false;
+
+    ChunkHeader *hdr = user_to_header(ptr);
+    if (!validate_header(ptr, hdr))
+      return false;
+
+    *before = status;
+    const uint32_t slot = hdr->slot;
+    if (!bit_is_set(slot))
+      std::abort(); // double-free detected // TODO: make a macro for this
+
+    if (g_zero_on_free.load(std::memory_order_relaxed)) {
+      std::memset(ptr, 0, chunk_usable);
+    }
+
+    bit_clear(slot);
+    used--;
+    if (slot < first_hint)
+      first_hint = slot;
+
+    status = (used == 0) ? EMPTY : ACTIVE;
+    *after = status;
+
+    if (usable_out)
+      *usable_out = chunk_usable;
+    return true;
+  }
+
+	// comm
+  bool enqueue_deferred_free(void *ptr, size_t *usable_out) {
+    if (!contains_ptr(ptr))
+      return false;
+
+    ChunkHeader *hdr = user_to_header(ptr);
+    if (!validate_header(ptr, hdr))
+      return false;
+
+    if (usable_out)
+      *usable_out = chunk_usable;
+    return deferred_frees.push(ptr);
+  }
+
+  size_t usable_size(void *ptr) const {
+    if (!contains_ptr(ptr))
+      return 0;
+
+    ChunkHeader *hdr = user_to_header(ptr);
+    if (!validate_header(ptr, hdr))
+      return 0;
+
+    if (g_uaf_check.load(std::memory_order_relaxed)) {
+      if (!bit_is_set(hdr->slot))
+        std::abort();
+    }
+
+    return chunk_usable;
+  }
+
+  page_kind_t get_size_class() const { return size_class; }
+  page_status_t get_status() const { return status; }
+  size_t get_chunk_usable() const { return chunk_usable; }
+  pid_t get_owner_tid() const { return owner_tid; }
+  uintptr_t get_base_addr() const { return reinterpret_cast<uintptr_t>(base); }
+  size_t get_span_size() const { return page_span; }
+  size_t get_segment_index() const { return owner_segment_idx; }
+  Segment *get_owner_segment() const { return owner_segment; }
+};
+
+class Segment {
+private:
+  void *base;
+  page_kind_t size_class;
+  size_t page_size;
+  size_t page_count;
+  std::unique_ptr<Page[]> pages;
+  std::atomic<size_t> next_candidate_idx;
+  std::atomic<uint32_t> full_pages;
+  std::atomic<bool> queued_non_full;
+  std::atomic<bool> fixed_chunk_set;
+  std::atomic<size_t> fixed_chunk_usable;
+  uint64_t key;
+  uint64_t canary;
+
+public:
+  Segment()
+      : base(nullptr), size_class(PAGE_SM), page_size(0), page_count(0), pages(),
+        next_candidate_idx(0), full_pages(0), queued_non_full(false),
+        fixed_chunk_set(false), fixed_chunk_usable(0), key(0), canary(0) {}
+
+  bool init(void *segment_base, page_kind_t kind, size_t seg_idx) {
+    if (!segment_base)
+      return false;
+
+    base = segment_base;
+    size_class = kind;
+    page_size = page_size_for_kind(kind);
+    page_count = SEGMENT_SIZE / page_size;
+    if (page_count == 0)
+      return false;
+
+    pages.reset(new Page[page_count]);
+    for (size_t i = 0; i < page_count; ++i) {
+      pages[i].set_owner_segment(this, seg_idx);
+    }
+
+    next_candidate_idx.store(0, std::memory_order_relaxed);
+    full_pages.store(0, std::memory_order_relaxed);
+    queued_non_full.store(false, std::memory_order_relaxed);
+    fixed_chunk_set.store(false, std::memory_order_relaxed);
+    fixed_chunk_usable.store(0, std::memory_order_relaxed);
+
+    key = generate_canary();
+    canary = key;
+    return true;
+  }
+
+  page_kind_t get_size_class() const { return size_class; }
+  bool check_canary(uint64_t expected) const { return canary == expected; }
+  uint64_t get_key() const { return key; }
+  size_t num_pages() const { return page_count; }
+
+  bool contains(void *ptr) const {
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    return p >= b && p < (b + SEGMENT_SIZE);
+  }
+
+  bool has_free_pages() const {
+    return full_pages.load(std::memory_order_relaxed) < page_count;
+  }
+
+  bool can_hold_request(size_t req) const {
+    if (size_class == PAGE_LG)
+      return true;
+    if (!fixed_chunk_set.load(std::memory_order_relaxed))
+      return true;
+    return req <= fixed_chunk_usable.load(std::memory_order_relaxed);
+  }
+
+  bool try_mark_enqueued() {
+    bool expected = false;
+    return queued_non_full.
+						compare_exchange_strong(expected, true,
+											std::memory_order_acq_rel, std::memory_order_relaxed); // prod/cons design
+  }
+
+  void clear_enqueued() { queued_non_full.store(false, std::memory_order_release); }
+
+  void *allocate(size_t req, Page **page_out) {
+    if (!page_out)
+      return nullptr;
+    if (!can_hold_request(req))
+      return nullptr;
+
+    const size_t start = next_candidate_idx.load(std::memory_order_relaxed) % page_count;
+    for (size_t step = 0; step < page_count; ++step) {
+      const size_t idx = (start + step) % page_count;
+      Page &page = pages[idx];
+      void *out = nullptr;
+      page_status_t before = EMPTY;
+      page_status_t after = EMPTY;
+      {
+        std::lock_guard<std::mutex> lk(page_lock_for(&page));
+        const size_t target_req =
+            (size_class != PAGE_LG && fixed_chunk_set.load(std::memory_order_relaxed))
+                ? fixed_chunk_usable.load(std::memory_order_relaxed)
+                : req;
+        if (!page.is_initialized()) {
+          void *page_base = static_cast<void *>(static_cast<char *>(base) + idx * page_size);
+          if (!page.init(page_base, size_class, target_req))
+            continue;
+          if (size_class != PAGE_LG &&
+              !fixed_chunk_set.load(std::memory_order_relaxed)) {
+            fixed_chunk_usable.store(page.get_chunk_usable(), std::memory_order_relaxed);
+            fixed_chunk_set.store(true, std::memory_order_relaxed);
+          }
+        }
+        if (!page.can_hold(req)) {
+          if (size_class != PAGE_LG || !page.retune_if_empty(req) || !page.can_hold(req))
+            continue;
+        }
+
+        out = page.allocate(req, &before, &after); // dispatch to page lvl alloc
+      }
+
+      if (!out)
+        continue;
+
+      if (before != FULL && after == FULL) {
+        full_pages.fetch_add(1, std::memory_order_relaxed);
+      }
+
+      next_candidate_idx.store((after == FULL) ? ((idx + 1) % page_count) : idx,
+                               std::memory_order_relaxed);
+      *page_out = &page;
+      return out;
+    }
+
+    return nullptr;
+  }
+
+  bool free_on_page(Page *page, void *ptr, size_t *usable_out, page_status_t *before,
+                    page_status_t *after) {
+    if (!page)
+      return false;
+
+    bool ok = false;
+    {
+      std::lock_guard<std::mutex> lk(page_lock_for(page));
+      ok = page->free_local(ptr, usable_out, before, after);
+    }
+    if (!ok)
+      return false;
+
+    if (*before == FULL && *after != FULL) {
+      full_pages.fetch_sub(1, std::memory_order_relaxed);
+    }
+    return true;
+  }
+};
+
+
+// comm
 typedef struct tc_page_s {
-  Page*       loc;
+  Page*				loc;
   page_kind_t kind;
-  size_t      size;
-  void*       freelist;
+  size_t 			size;
+  void*				freelist;
 } tc_page_t;
 
+//comm
 class ThreadCache {
-	private:
-		static std::atomic<uint32_t> live_threads;
-		pid_t tid;
-		bool is_active;
-		std::vector<tc_page_t*> pages;
-		Page* cached_pages[3];
-		uintptr_t cached_page_bases[3];
-		uintptr_t cached_page_ends[3];
-		size_t preferred_seg_idx[3];
-		bool preferred_seg_valid[3];
+private:
+  static std::atomic<uint32_t> live_threads;
+  pid_t tid;
+  bool is_active;
+  std::vector<tc_page_t *> pages;
+  Page *cached_pages[3];
+  uintptr_t cached_page_bases[3];
+  uintptr_t cached_page_ends[3];
+  size_t preferred_seg_idx[3];
+  bool preferred_seg_valid[3];
 
-	public:
-		ThreadCache()
-				: tid(current_tid()), is_active(true), pages(),
-					cached_pages{nullptr, nullptr, nullptr},
-					cached_page_bases{0, 0, 0},
-					cached_page_ends{0, 0, 0},
-					preferred_seg_idx{0, 0, 0},
-					preferred_seg_valid{false, false, false} {
-			live_threads.fetch_add(1, std::memory_order_relaxed);
-		}
-		~ThreadCache() {
-			live_threads.fetch_sub(1, std::memory_order_relaxed);
-		}
-		static ThreadCache* current() {
-			static thread_local ThreadCache instance;
-			return &instance;
-		}
-		static bool is_multi_threaded() {
-			return live_threads.load(std::memory_order_relaxed) > 1;
-		}
-		pid_t get_tid() const { return tid; }
-		bool get_active() const { return is_active; }
-		void set_active(bool active) { is_active = active; }
-		void add_page(tc_page_t* page) { pages.push_back(page); }
-		std::vector<tc_page_t*>& get_pages() { return pages; }
+public:
+  ThreadCache()
+      : tid(current_tid()), is_active(true), pages(),
+        cached_pages{nullptr, nullptr, nullptr}, cached_page_bases{0, 0, 0},
+        cached_page_ends{0, 0, 0}, preferred_seg_idx{0, 0, 0},
+        preferred_seg_valid{false, false, false} {
+    live_threads.fetch_add(1, std::memory_order_relaxed);
+  }
 
-		Page* get_cached_page(page_kind_t kind) const {
-			if (kind > PAGE_LG)
-				return nullptr;
-			return cached_pages[static_cast<size_t>(kind)];
-		}
+  ~ThreadCache() { live_threads.fetch_sub(1, std::memory_order_relaxed); }
 
-		void cache_page(page_kind_t kind, Page* page, uintptr_t page_base, size_t page_size) {
-			if (kind > PAGE_LG)
-				return;
-			size_t idx = static_cast<size_t>(kind);
-			cached_pages[idx] = page;
-			cached_page_bases[idx] = page_base;
-			cached_page_ends[idx] = page_base + page_size;
-		}
+  static ThreadCache *current() {
+    static thread_local ThreadCache instance;
+    return &instance;
+  }
 
-		void clear_cached_page(page_kind_t kind, Page* page) {
-			if (kind > PAGE_LG)
-				return;
-			size_t idx = static_cast<size_t>(kind);
-			if (cached_pages[idx] == page) {
-				cached_pages[idx] = nullptr;
-				cached_page_bases[idx] = 0;
-				cached_page_ends[idx] = 0;
-			}
-		}
+  static bool is_multi_threaded() {
+    return live_threads.load(std::memory_order_relaxed) > 1;
+  }
 
-		bool lookup_cached_for_ptr(void* ptr, page_kind_t* kind_out, Page** page_out) const {
-			if (!ptr || !kind_out || !page_out)
-				return false;
-			const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
-			for (int k = PAGE_SM; k <= PAGE_LG; ++k) {
-				const size_t idx = static_cast<size_t>(k);
-				Page* page = cached_pages[idx];
-				if (page && p >= cached_page_bases[idx] && p < cached_page_ends[idx]) {
-					*kind_out = static_cast<page_kind_t>(k);
-					*page_out = page;
-					return true;
-				}
-			}
-			return false;
-		}
+  pid_t get_tid() const { return tid; }
+  bool get_active() const { return is_active; }
 
-		bool get_preferred_segment(page_kind_t kind, size_t* idx_out) const {
-			if (!idx_out || kind > PAGE_LG)
-				return false;
-			const size_t idx = static_cast<size_t>(kind);
-			if (!preferred_seg_valid[idx])
-				return false;
-			*idx_out = preferred_seg_idx[idx];
-			return true;
-		}
+  Page *get_cached_page(page_kind_t kind) const {
+    if (kind > PAGE_LG)
+      return nullptr;
+    return cached_pages[class_index_for_kind(kind)];
+  }
 
-		void set_preferred_segment(page_kind_t kind, size_t seg_idx) {
-			if (kind > PAGE_LG)
-				return;
-			const size_t idx = static_cast<size_t>(kind);
-			preferred_seg_idx[idx] = seg_idx;
-			preferred_seg_valid[idx] = true;
-		}
+  void cache_page(page_kind_t kind, Page *page, uintptr_t page_base, size_t page_size) {
+    if (kind > PAGE_LG)
+      return;
+    const size_t idx = class_index_for_kind(kind);
+    cached_pages[idx] = page;
+    cached_page_bases[idx] = page_base;
+    cached_page_ends[idx] = page_base + page_size;
+  }
+
+  void clear_cached_page(page_kind_t kind, Page *page) {
+    if (kind > PAGE_LG)
+      return;
+    const size_t idx = class_index_for_kind(kind);
+    if (cached_pages[idx] == page) {
+      cached_pages[idx] = nullptr;
+      cached_page_bases[idx] = 0;
+      cached_page_ends[idx] = 0;
+    }
+  }
+
+  bool get_preferred_segment(page_kind_t kind, size_t *idx_out) const {
+    if (!idx_out || kind > PAGE_LG)
+      return false;
+    const size_t idx = class_index_for_kind(kind);
+    if (!preferred_seg_valid[idx])
+      return false;
+    *idx_out = preferred_seg_idx[idx];
+    return true;
+  }
+
+  void set_preferred_segment(page_kind_t kind, size_t seg_idx) {
+    if (kind > PAGE_LG)
+      return;
+    const size_t idx = class_index_for_kind(kind);
+    preferred_seg_idx[idx] = seg_idx;
+    preferred_seg_valid[idx] = true;
+  }
 };
 
 std::atomic<uint32_t> ThreadCache::live_threads{0};
 
-class Page {
-	private:
-		ThreadCache* owner_tc;
-		pid_t owner_tid;
-		page_kind_t size_class;
-		uint32_t slot_count;
-		uint8_t is_committed : 1;
-		uint16_t num_committed;
-		uint16_t reserved;
-		uint16_t capacity;
-		bool use_bitmap;
-		std::vector<Chunk*> freelist;
-		uint16_t used;
-		size_t chunk_sz;
-		Chunk* page_start;
-		page_status_t status;
-		uint64_t prng_state;
-		PageRuntime runtime;
-
-	public:
-		Page()
-				: owner_tc(nullptr), owner_tid(0), size_class(PAGE_SM), slot_count(0), is_committed(0),
-					num_committed(0), reserved(0), capacity(0), use_bitmap(true),
-					freelist(), used(0), chunk_sz(0), page_start(nullptr),
-					status(EMPTY), prng_state(0), runtime() {}
-
-		bool init(void* base, page_kind_t kind, size_t chunk_size) {
-			if (!base || chunk_size == 0)
-				return false;
-
-			runtime.base = base;
-			runtime.chunk_size = align_up(chunk_size, 16);
-			runtime.capacity = page_size_for_kind(kind) / runtime.chunk_size;
-			runtime.used = 0;
-			runtime.initialized = runtime.capacity > 0;
-			if (!runtime.initialized)
-				return false;
-
-			owner_tc = nullptr;
-			owner_tid = 0;
-			size_class = kind;
-			slot_count = static_cast<uint32_t>(runtime.capacity);
-			is_committed = 1;
-			num_committed = static_cast<uint16_t>(runtime.capacity);
-			reserved = static_cast<uint16_t>(runtime.capacity);
-			capacity = static_cast<uint16_t>(runtime.capacity);
-			use_bitmap = true;
-			used = 0;
-			chunk_sz = runtime.chunk_size;
-			status = EMPTY;
-			prng_state = generate_canary();
-
-			runtime.chunks.clear();
-			runtime.freelist.clear();
-			runtime.deferred_buf = std::make_shared<std::array<std::byte, 2048>>();
-			runtime.deferred_res = std::make_shared<std::pmr::monotonic_buffer_resource>(
-					runtime.deferred_buf->data(), runtime.deferred_buf->size());
-			runtime.deferred_frees = std::make_shared<std::pmr::vector<void*>>(runtime.deferred_res.get());
-			runtime.chunks.reserve(runtime.capacity);
-			runtime.freelist.reserve(runtime.capacity);
-			freelist.clear();
-			freelist.reserve(runtime.capacity);
-
-			for (size_t i = 0; i < runtime.capacity; ++i) {
-				void* ptr = static_cast<void*>(static_cast<char*>(runtime.base) + i * runtime.chunk_size);
-				runtime.chunks.emplace_back(this, ptr, runtime.chunk_size);
-				runtime.freelist.push_back(static_cast<uint32_t>(i));
-				freelist.push_back(&runtime.chunks.back());
-			}
-			page_start = runtime.chunks.empty() ? nullptr : &runtime.chunks.front();
-			return true;
-		}
-
-		bool release_chunk_by_index(size_t idx, size_t* usable_out) {
-			if (idx >= runtime.chunks.size())
-				return false;
-			Chunk& c = runtime.chunks[idx];
-			// state change guard for all free paths
-			if (!c.is_in_use())
-				std::abort();
-			if (g_zero_on_free.load(std::memory_order_relaxed)) {
-				std::memset(c.get_data(), 0, runtime.chunk_size);
-			}
-			c.mark_free();
-			runtime.freelist.push_back(static_cast<uint32_t>(idx));
-			runtime.used--;
-			used = static_cast<uint16_t>(runtime.used);
-			if (usable_out) {
-				*usable_out = runtime.chunk_size;
-			}
-			status = (runtime.used == 0) ? EMPTY : ACTIVE;
-			return true;
-		}
-
-		bool is_initialized() const { return runtime.initialized; }
-		bool contains(void* ptr) const {
-			if (!runtime.initialized || !ptr)
-				return false;
-			uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
-			uintptr_t b = reinterpret_cast<uintptr_t>(runtime.base);
-			uintptr_t e = b + page_size_for_kind(size_class);
-			return p >= b && p < e;
-		}
-
-		bool can_hold(size_t req) const {
-			return runtime.initialized && req <= runtime.chunk_size;
-		}
-
-		void drain_deferred(size_t max_to_drain = 8) {
-			if (!runtime.deferred_frees)
-				return;
-			size_t drained = 0;
-			while (!runtime.deferred_frees->empty() && drained < max_to_drain) {
-				void* deferred_ptr = runtime.deferred_frees->back();
-				runtime.deferred_frees->pop_back();
-
-				uintptr_t off = reinterpret_cast<uintptr_t>(deferred_ptr) - reinterpret_cast<uintptr_t>(runtime.base);
-				size_t idx = off / runtime.chunk_size;
-				if (!release_chunk_by_index(idx, nullptr))
-					std::abort();
-				drained++;
-			}
-		}
-
-		void* allocate(size_t req) {
-			if (runtime.deferred_frees && !runtime.deferred_frees->empty()) {
-				const size_t deferred_count = runtime.deferred_frees->size();
-				const size_t free_count = runtime.freelist.size();
-				if (free_count < 4 || deferred_count >= 64) {
-					const size_t drain_target = (deferred_count >= 64) ? 32 : 16;
-					drain_deferred(drain_target);
-				}
-			}
-			if (!can_hold(req) || runtime.freelist.empty())
-				return nullptr;
-			if (owner_tid == 0) {
-				owner_tid = current_tid();
-			}
-			uint32_t idx = runtime.freelist.back();
-			runtime.freelist.pop_back();
-			if (idx >= runtime.chunks.size()) // make sure this can't underflow. Check .back() specifications
-				return nullptr;
-			Chunk* c = &runtime.chunks[idx];
-			c->mark_used();
-			used = static_cast<uint16_t>(runtime.used + 1);
-			runtime.used++;
-			status = (runtime.used == runtime.capacity) ? FULL : ACTIVE;
-			return c->get_data();
-		}
-
-		bool free_ptr(void* ptr, size_t* usable_out) {
-			if (!contains(ptr))
-				return false;
-			if (g_uaf_check.load(std::memory_order_relaxed)) {
-				const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
-				const uintptr_t b = reinterpret_cast<uintptr_t>(runtime.base);
-				if (p < b || p >= b + page_size_for_kind(size_class))
-					std::abort();
-			}
-			uintptr_t off = reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(runtime.base);
-			size_t idx = off / runtime.chunk_size;
-			return release_chunk_by_index(idx, usable_out);
-		}
-
-		bool enqueue_deferred_free(void* ptr, size_t* usable_out) {
-			if (!contains(ptr))
-				return false;
-			if (!runtime.deferred_frees)
-				return false;
-			runtime.deferred_frees->push_back(ptr);
-			if (usable_out) {
-				*usable_out = runtime.chunk_size;
-			}
-			return true;
-		}
-
-		size_t usable_size(void* ptr) const {
-			if (!contains(ptr))
-				return 0;
-			if (g_uaf_check.load(std::memory_order_relaxed)) {
-				const uintptr_t off = reinterpret_cast<uintptr_t>(ptr) - reinterpret_cast<uintptr_t>(runtime.base);
-				const size_t idx = off / runtime.chunk_size;
-				if (idx >= runtime.chunks.size() || !runtime.chunks[idx].is_in_use()) {
-					std::abort();
-				}
-			}
-			return runtime.chunk_size;
-		}
-
-		page_status_t get_status() const { return status; }
-		page_kind_t get_size_class() const { return size_class; }
-		size_t get_chunk_size() const { return runtime.chunk_size; }
-		uintptr_t get_base_addr() const { return reinterpret_cast<uintptr_t>(runtime.base); }
-		size_t get_span_size() const { return page_size_for_kind(size_class); }
-		uint16_t get_used() const { return used; }
-		pid_t get_owner_tid() const { return owner_tid; }
-		void* find_space() { return allocate(runtime.chunk_size); }
+struct ClassShard {
+  std::mutex 					mu;
+  std::vector<size_t> segments;
+  std::deque<size_t> 	non_full_segments;
 };
 
-class Segment {
-	private:
-		page_kind_t size_class;
-		std::vector<Page> slots;
-		uint64_t active_bm;
-		uint64_t canary;
-		uint64_t key;
-		SegmentRuntime runtime;
-		size_t next_candidate_idx;
 
-	public:
-		Segment() : size_class(PAGE_SM), slots(), active_bm(0), canary(0), key(0), runtime(), next_candidate_idx(0) {}
-		~Segment() = default;
-
-		bool init(void* base, page_kind_t kind) {
-			if (!base)
-				return false;
-			runtime.base = base;
-			runtime.page_kind = kind;
-			runtime.page_size = page_size_for_kind(kind);
-			runtime.page_count = SEGMENT_SIZE / runtime.page_size;
-			runtime.pages.assign(runtime.page_count, PageRuntime{});
-
-			size_class = kind;
-			active_bm = 0;
-			next_candidate_idx = 0;
-			key = generate_canary();
-			canary = key;
-			slots.clear();
-			slots.reserve(runtime.page_count);
-			for (size_t i = 0; i < runtime.page_count; ++i) {
-				slots.emplace_back();
-			}
-			return true;
-		}
-
-		page_kind_t get_size_class() const { return size_class; }
-		uint64_t get_key() const { return key; }
-		bool check_canary(uint64_t expected) const { return canary == expected; }
-		size_t num_pages() const { return slots.size(); }
-
-		bool contains(void* ptr) const {
-			uintptr_t b = reinterpret_cast<uintptr_t>(runtime.base);
-			uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
-			return p >= b && p < (b + SEGMENT_SIZE);
-		}
-
-		Page* find_page_for(void* ptr) {
-			if (!contains(ptr))
-				return nullptr;
-			uintptr_t b = reinterpret_cast<uintptr_t>(runtime.base);
-			uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
-			size_t idx = (p - b) / runtime.page_size;
-			if (idx >= slots.size())
-				return nullptr;
-			return &slots[idx];
-		}
-
-		void* allocate(size_t req) {
-			if (slots.empty())
-				return nullptr;
-			size_t start = 0;
-			{
-				std::lock_guard<std::mutex> seg_lk(segment_lock_for(this));
-				start = next_candidate_idx % slots.size();
-			}
-			for (size_t step = 0; step < slots.size(); ++step) {
-				size_t i = (start + step) % slots.size();
-				Page& page = slots[i];
-				void* out = nullptr;
-				page_status_t new_status = EMPTY;
-				{
-					std::lock_guard<std::mutex> page_lk(page_lock_for(&page));
-					if (!page.is_initialized()) {
-						void* pbase = static_cast<void*>(static_cast<char*>(runtime.base) + (i * runtime.page_size));
-						if (!page.init(pbase, size_class, req))
-							continue;
-					}
-					if (!page.can_hold(req))
-						continue;
-					out = page.allocate(req);
-					if (!out)
-						continue;
-					new_status = page.get_status();
-				}
-				{
-					std::lock_guard<std::mutex> seg_lk(segment_lock_for(this));
-					active_bm |= (1ULL << (i % 64));
-					next_candidate_idx = (new_status == FULL) ? ((i + 1) % slots.size()) : i;
-				}
-				return out;
-			}
-			return nullptr;
-		}
-
-		bool free_ptr(void* ptr, size_t* usable_out) {
-			Page* page = find_page_for(ptr);
-			if (!page)
-				return false;
-			bool ok = false;
-			page_status_t status_after_free = FULL;
-			{
-				std::lock_guard<std::mutex> page_lk(page_lock_for(page));
-				ok = page->free_ptr(ptr, usable_out);
-				if (ok)
-					status_after_free = page->get_status();
-			}
-			if (!ok)
-				return false;
-			uintptr_t b = reinterpret_cast<uintptr_t>(runtime.base);
-			uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
-			size_t idx = (p - b) / runtime.page_size;
-			if (idx < slots.size()) {
-				std::lock_guard<std::mutex> seg_lk(segment_lock_for(this));
-				if (status_after_free == EMPTY) {
-					active_bm &= ~(1ULL << (idx % 64));
-				}
-				next_candidate_idx = idx;
-			}
-			return true;
-		}
-
-		size_t usable_size(void* ptr) {
-			Page* page = find_page_for(ptr);
-			if (!page)
-				return 0;
-			return page->usable_size(ptr);
-		}
-
-		bool is_fully_empty() const {
-			for (const Page& p : slots) {
-				if (p.is_initialized() && p.get_status() != EMPTY)
-					return false;
-			}
-			return true;
-		}
-};
-
-class Heap {
+class HeapState {
 private:
   memid_t memid;
-  void* base;
+  void *base;
   size_t reserved_size;
   uint32_t num_segments;
-  std::vector<Segment> layout;
+  std::vector<std::unique_ptr<Segment>> layout;
   std::vector<segment_kind_t> seg_kind;
-  std::vector<void*> seg_bases;
+  std::vector<void *> seg_bases;
   std::vector<page_kind_t> seg_page_kind;
-  std::unordered_map<uintptr_t, size_t> seg_index_by_base;
-  std::unordered_map<uintptr_t, size_t> xl_allocs;
   memkind_t mem_kind;
   uint64_t canary;
   size_t reserved_cursor;
   std::mutex heap_mu;
+  std::array<ClassShard, 3> class_shards;
 
-  bool add_segment_nolock(void* segment_base, segment_kind_t kind, page_kind_t page_kind) {
+  ClassShard &shard_for(page_kind_t kind) {
+    return class_shards[class_index_for_kind(kind)];
+  }
+
+  void enqueue_non_full_segment(page_kind_t kind, size_t seg_idx) {
+    if (seg_idx >= layout.size())
+      return;
+    Segment *seg = layout[seg_idx].get();
+    if (!seg || !seg->has_free_pages())
+      return;
+    if (!seg->try_mark_enqueued())
+      return;
+
+    ClassShard &shard = shard_for(kind);
+    std::lock_guard<std::mutex> lk(shard.mu);
+    shard.non_full_segments.push_back(seg_idx);
+  }
+
+  bool add_segment_nolock(void *segment_base, segment_kind_t kind, page_kind_t page_kind) {
     if (!segment_base)
       return false;
-    layout.emplace_back();
-    if (!layout.back().init(segment_base, page_kind)) {
-      layout.pop_back();
+
+    const size_t idx = layout.size();
+    auto seg = std::make_unique<Segment>();
+    if (!seg->init(segment_base, page_kind, idx))
       return false;
-    }
+
+    layout.push_back(std::move(seg));
     seg_kind.push_back(kind);
     seg_bases.push_back(segment_base);
     seg_page_kind.push_back(page_kind);
-    seg_index_by_base[reinterpret_cast<uintptr_t>(segment_base)] = layout.size() - 1;
     num_segments = static_cast<uint32_t>(layout.size());
+
+    ClassShard &shard = shard_for(page_kind);
+    {
+      std::lock_guard<std::mutex> lk(shard.mu);
+      shard.segments.push_back(idx);
+    }
+    enqueue_non_full_segment(page_kind, idx);
+
     if (!base || reinterpret_cast<uintptr_t>(segment_base) < reinterpret_cast<uintptr_t>(base))
       base = segment_base;
+
     return true;
   }
 
@@ -587,47 +750,102 @@ private:
       return false;
     if (reserved_cursor + SEGMENT_SIZE > reserved_size)
       return false;
-    void* seg_base = static_cast<void*>(static_cast<char*>(base) + reserved_cursor);
+
+    void *seg_base = static_cast<void *>(static_cast<char *>(base) + reserved_cursor);
     if (!commit_region(seg_base, SEGMENT_SIZE))
       return false;
+
     reserved_cursor += SEGMENT_SIZE;
     return add_segment_nolock(seg_base, kind, page_kind);
   }
 
-  Heap()
-      : memid(), base(nullptr), reserved_size(0), num_segments(0), layout(),
-        seg_kind(), seg_bases(), seg_page_kind(), seg_index_by_base(),
-        xl_allocs(),
-        mem_kind(MEM_NONE), canary(0),
-        reserved_cursor(0) {}
-  ~Heap() = default;
+	//comm
+  void *alloc_xl(size_t size) {
+    if (size >= (SIZE_MAX - 4096))
+      return nullptr;
+    if (size > HEAP_RESERVED_DEFAULT)
+      return nullptr;
+
+    const size_t usable = align_up(size, 16);
+    const size_t map_size = align_up(usable + sizeof(XLHeader), 4096);
+    void *raw = alloc_segment(map_size);
+    if (!raw)
+      return nullptr;
+
+    auto *hdr = static_cast<XLHeader *>(raw);
+    hdr->magic = XL_MAGIC;
+    hdr->mapping_size = map_size;
+    hdr->usable_size = map_size - sizeof(XLHeader);
+    hdr->reserved = 0;
+
+    return static_cast<void *>(reinterpret_cast<char *>(raw) + sizeof(XLHeader));
+  }
+
+  bool free_xl(void *ptr, size_t *usable_out) {
+    if (!ptr)
+      return false;
+    auto *hdr = reinterpret_cast<XLHeader *>(static_cast<char *>(ptr) - sizeof(XLHeader));
+    if (hdr->magic != XL_MAGIC)
+      return false;
+
+    if (g_zero_on_free.load(std::memory_order_relaxed)) {
+      std::memset(ptr, 0, hdr->usable_size);
+    }
+    if (usable_out)
+      *usable_out = hdr->usable_size;
+
+    free_segment(hdr, hdr->mapping_size);
+    return true;
+  }
+
+  size_t usable_xl(void *ptr) {
+    if (!ptr)
+      return 0;
+    auto *hdr = reinterpret_cast<XLHeader *>(static_cast<char *>(ptr) - sizeof(XLHeader));
+    if (hdr->magic != XL_MAGIC)
+      return 0;
+    return hdr->usable_size;
+  }
 
 public:
-  static Heap& instance() {
-    static Heap heap;
+  HeapState()
+      : memid(), base(nullptr), reserved_size(0), num_segments(0), layout(),
+        seg_kind(), seg_bases(), seg_page_kind(), mem_kind(MEM_NONE), canary(0),
+        reserved_cursor(0), heap_mu(), class_shards() {}
+
+  static HeapState &instance() {
+    static HeapState heap;
     return heap;
   }
 
-  bool init_reserved(void* reserved_base, size_t size) {
+  bool init_reserved(void *reserved_base, size_t size) {
     if (!reserved_base || size == 0)
       return false;
+
     std::lock_guard<std::mutex> lk(heap_mu);
     base = reserved_base;
     reserved_size = size;
     reserved_cursor = 0;
     canary = generate_canary();
     mem_kind = MEM_OS;
-    size_t cap = size / SEGMENT_SIZE;
+
+    const size_t cap = size / SEGMENT_SIZE;
     layout.reserve(cap);
     seg_kind.reserve(cap);
     seg_bases.reserve(cap);
     seg_page_kind.reserve(cap);
-    seg_index_by_base.clear();
-    xl_allocs.clear();
+
+		// comm
+    for (ClassShard &shard : class_shards) {
+      std::lock_guard<std::mutex> shard_lk(shard.mu);
+      shard.segments.clear();
+      shard.non_full_segments.clear();
+    }
+
     return true;
   }
 
-  bool add_segment(void* segment_base, segment_kind_t kind, page_kind_t page_kind) {
+  bool add_segment(void *segment_base, segment_kind_t kind, page_kind_t page_kind) {
     std::lock_guard<std::mutex> lk(heap_mu);
     return add_segment_nolock(segment_base, kind, page_kind);
   }
@@ -637,227 +855,212 @@ public:
     return add_segment_from_reserved_nolock(kind, page_kind);
   }
 
-  Segment* find_segment_for(void* ptr) {
-    if (!ptr)
-      return nullptr;
-    uintptr_t masked = reinterpret_cast<uintptr_t>(ptr) & ~SEGMENT_MASK;
-    auto it = seg_index_by_base.find(masked);
-    if (it != seg_index_by_base.end()) {
-      const size_t idx = it->second;
-      if (idx < layout.size())
-        return &layout[idx];
-    }
-    for (size_t i = 0; i < layout.size(); ++i) {
-      if (layout[i].contains(ptr))
-        return &layout[i];
-    }
-    return nullptr;
-  }
-
-  Segment* get_or_create_segment(page_kind_t kind) {
-    {
-      std::lock_guard<std::mutex> lk(heap_mu);
-      for (size_t i = 0; i < layout.size(); ++i) {
-        if (seg_page_kind[i] == kind)
-          return &layout[i];
-      }
-    }
-    {
-      std::lock_guard<std::mutex> lk(heap_mu);
-      if (add_segment_from_reserved_nolock(SEGMENT_NORM, kind))
-        return &layout.back();
-    }
-    void* seg = alloc_segment(SEGMENT_SIZE);
-    if (!seg)
-      return nullptr;
-    {
-      std::lock_guard<std::mutex> lk(heap_mu);
-      if (!add_segment_nolock(seg, SEGMENT_NORM, kind)) {
-        free_segment(seg, SEGMENT_SIZE);
-        return nullptr;
-      }
-      return &layout.back();
-    }
-  }
-
-  void* allocate(size_t size) {
-    ThreadCache* tc = ThreadCache::current();
+  void *allocate(size_t size) {
+    ThreadCache *tc = ThreadCache::current();
     const bool mt = ThreadCache::is_multi_threaded();
+
     page_kind_t kind = class_for_size(size);
     if (kind == PAGE_XL) {
-      std::lock_guard<std::mutex> lk(heap_mu);
-      if (size >= (SIZE_MAX - 4096))
-        return nullptr;
-      if (size > HEAP_RESERVED_DEFAULT)
-        return nullptr;
-      size_t need = align_up(size, 4096);
-      void* ptr = alloc_segment(need);
-      if (!ptr)
-        return nullptr;
-      xl_allocs[reinterpret_cast<uintptr_t>(ptr)] = need;
-      return ptr;
+      // Keep <= 4MiB-in-page requests off XL mmap path.
+      const size_t large_fit_limit = LARGE_PAGE_SIZE - sizeof(ChunkHeader);
+      if (size <= large_fit_limit) {
+        kind = PAGE_LG;
+      } else {
+        return alloc_xl(size);
+      }
     }
+
     const size_t need = align_up(size, 16);
+
+    // ideal path
     if (tc->get_active()) {
-      Page* cached = tc->get_cached_page(kind);
+      Page *cached = tc->get_cached_page(kind);
       if (cached) {
-        void* fast = nullptr;
+        void *fast = nullptr;
+        page_status_t before = EMPTY;
+        page_status_t after = EMPTY;
         if (mt) {
           std::lock_guard<std::mutex> lk(page_lock_for(cached));
-          fast = cached->allocate(need);
+          if (!cached->is_initialized()) {
+            tc->clear_cached_page(kind, cached);
+          } else {
+            fast = cached->allocate(need, &before, &after);
+          }
         } else {
-          fast = cached->allocate(need);
+          if (cached->is_initialized())
+            fast = cached->allocate(need, &before, &after);
+          else
+            tc->clear_cached_page(kind, cached);
         }
         if (fast)
           return fast;
       }
     }
 
-    {
-      std::lock_guard<std::mutex> lk(heap_mu);
-      size_t preferred_idx = 0;
-      if (tc->get_active() && tc->get_preferred_segment(kind, &preferred_idx) &&
-          preferred_idx < layout.size() && seg_page_kind[preferred_idx] == kind) {
-        void* ptr = layout[preferred_idx].allocate(need);
-        if (ptr) {
-          Page* page = layout[preferred_idx].find_page_for(ptr);
-          if (page) {
-            tc->cache_page(kind, page, page->get_base_addr(), page->get_span_size());
-          }
-          return ptr;
-        }
+		// comm
+    auto try_segment = [&](size_t seg_idx) -> void * {
+      if (seg_idx >= layout.size())
+        return nullptr;
+      Segment *seg = layout[seg_idx].get();
+      if (!seg || seg->get_size_class() != kind)
+        return nullptr;
+      if (!seg->can_hold_request(need))
+        return nullptr;
+
+      Page *page = nullptr;
+      void *ptr = seg->allocate(need, &page);
+      if (seg->has_free_pages() && seg->can_hold_request(need))
+        enqueue_non_full_segment(kind, seg_idx);
+
+      if (!ptr)
+        return nullptr;
+
+      if (tc->get_active()) {
+        tc->set_preferred_segment(kind, seg_idx);
+        if (page)
+          tc->cache_page(kind, page, page->get_base_addr(), page->get_span_size());
       }
-      for (size_t i = 0; i < layout.size(); ++i) {
-        if (seg_page_kind[i] != kind)
-          continue;
-        void* ptr = layout[i].allocate(need);
-        if (ptr) {
-          if (tc->get_active()) {
-            tc->set_preferred_segment(kind, i);
-          }
-          Page* page = layout[i].find_page_for(ptr);
-          if (page) {
-            tc->cache_page(kind, page, page->get_base_addr(), page->get_span_size());
-          }
+      return ptr;
+    };
+
+    if (tc->get_active()) {
+      size_t preferred = 0;
+      if (tc->get_preferred_segment(kind, &preferred)) {
+        if (void *ptr = try_segment(preferred))
           return ptr;
-        }
       }
     }
 
+    // non full segment queue per size class
+		// comm
+    {
+      ClassShard &shard = shard_for(kind);
+      size_t probes = 0;
+      while (probes < MAX_QUEUE_PROBES_PER_ALLOC) {
+        size_t idx = SIZE_MAX;
+        {
+          std::lock_guard<std::mutex> lk(shard.mu);
+          if (shard.non_full_segments.empty())
+            break;
+          idx = shard.non_full_segments.front();
+          shard.non_full_segments.pop_front();
+        }
+        probes++;
+
+        if (idx >= layout.size())
+          continue;
+        Segment *seg = layout[idx].get();
+        if (!seg || seg->get_size_class() != kind)
+          continue;
+        seg->clear_enqueued();
+
+        if (void *ptr = try_segment(idx))
+          return ptr;
+      }
+    }
+
+    // slow path
+    std::vector<size_t> candidates;
+    {
+      ClassShard &shard = shard_for(kind);
+      std::lock_guard<std::mutex> lk(shard.mu);
+      candidates = shard.segments;
+    }
+
+    size_t fallback_scans = 0;
+    for (size_t idx : candidates) {
+      if (fallback_scans >= MAX_FALLBACK_SCANS_PER_ALLOC)
+        break;
+      fallback_scans++;
+      if (void *ptr = try_segment(idx))
+        return ptr;
+    }
+
+    // stupid slow path
     {
       std::lock_guard<std::mutex> lk(heap_mu);
       if (add_segment_from_reserved_nolock(SEGMENT_NORM, kind)) {
-        if (tc->get_active()) {
-          tc->set_preferred_segment(kind, layout.size() - 1);
-        }
-        void* ptr = layout.back().allocate(need);
-        if (ptr) {
-          Page* page = layout.back().find_page_for(ptr);
-          if (page) {
-            tc->cache_page(kind, page, page->get_base_addr(), page->get_span_size());
-          }
-        }
-        return ptr;
+        return try_segment(layout.size() - 1);
       }
     }
 
-    void* seg_mem = alloc_segment(SEGMENT_SIZE);
+    void *seg_mem = alloc_segment(SEGMENT_SIZE);
     if (!seg_mem)
       return nullptr;
+
     {
       std::lock_guard<std::mutex> lk(heap_mu);
       if (!add_segment_nolock(seg_mem, SEGMENT_NORM, kind)) {
         free_segment(seg_mem, SEGMENT_SIZE);
         return nullptr;
       }
-      if (tc->get_active()) {
-        tc->set_preferred_segment(kind, layout.size() - 1);
-      }
-      void* ptr = layout.back().allocate(need);
-      if (ptr) {
-        Page* page = layout.back().find_page_for(ptr);
-        if (page) {
-          tc->cache_page(kind, page, page->get_base_addr(), page->get_span_size());
-        }
-      }
-      return ptr;
+      return try_segment(layout.size() - 1);
     }
   }
 
-  bool free_ptr(void* ptr, size_t* usable_out) {
+	// comm 
+  bool free_ptr(void *ptr, size_t *usable_out) {
     if (!ptr)
       return true;
-    ThreadCache* tc = ThreadCache::current();
-    if (tc->get_active()) {
-      page_kind_t kind = PAGE_SM;
-      Page* cached = nullptr;
-      if (tc->lookup_cached_for_ptr(ptr, &kind, &cached) && cached) {
-        bool ok = false;
-        {
-          std::lock_guard<std::mutex> lk(page_lock_for(cached));
-          if (cached->get_owner_tid() != 0 && cached->get_owner_tid() != tc->get_tid()) {
-            ok = cached->enqueue_deferred_free(ptr, usable_out);
-          } else {
-            ok = cached->free_ptr(ptr, usable_out);
-          }
-        }
-        if (ok) {
-          if (cached->get_status() == EMPTY) {
-            tc->clear_cached_page(kind, cached);
-          }
-          return true;
-        }
-      }
-    }
 
-    std::lock_guard<std::mutex> lk(heap_mu);
-    Segment* seg = find_segment_for(ptr);
-    if (seg) {
-      Page* page = seg->find_page_for(ptr);
-      if (!page)
+    ThreadCache *tc = ThreadCache::current();
+
+    ChunkHeader *chdr = reinterpret_cast<ChunkHeader *>(static_cast<char *>(ptr) - sizeof(ChunkHeader));
+    if (chdr->magic == CHUNK_MAGIC && chdr->owner) {
+      Page *page = chdr->owner;
+      Segment *seg = page->get_owner_segment();
+      if (!seg)
         return false;
+
+      const page_kind_t kind = page->get_size_class();
+      const pid_t owner_tid = page->get_owner_tid();
+      const bool remote_owner = (owner_tid != 0 && owner_tid != tc->get_tid());
+
       bool ok = false;
-      if (page->get_owner_tid() != 0 && page->get_owner_tid() != tc->get_tid()) {
-        std::lock_guard<std::mutex> page_lk(page_lock_for(page));
+      page_status_t before = EMPTY;
+      page_status_t after = EMPTY;
+
+      if (remote_owner) {
         ok = page->enqueue_deferred_free(ptr, usable_out);
+        if (!ok) {
+          ok = seg->free_on_page(page, ptr, usable_out, &before, &after);
+        }
       } else {
-        ok = seg->free_ptr(ptr, usable_out);
+        ok = seg->free_on_page(page, ptr, usable_out, &before, &after);
       }
+
       if (!ok)
         std::abort();
+
+      if (!remote_owner && before == FULL && after != FULL) {
+        enqueue_non_full_segment(kind, page->get_segment_index());
+      }
+
       if (tc->get_active()) {
-        const page_kind_t kind = page->get_size_class();
         tc->cache_page(kind, page, page->get_base_addr(), page->get_span_size());
-        if (page->get_status() == EMPTY) {
+        if (page->get_status() == EMPTY)
           tc->clear_cached_page(kind, page);
-        }
       }
+
       return true;
     }
-    auto xl_it = xl_allocs.find(reinterpret_cast<uintptr_t>(ptr));
-    if (xl_it != xl_allocs.end()) {
-      size_t sz = xl_it->second;
-      if (g_zero_on_free.load(std::memory_order_relaxed)) {
-        std::memset(ptr, 0, sz);
-      }
-      free_segment(ptr, sz);
-      if (usable_out)
-        *usable_out = sz;
-      xl_allocs.erase(xl_it);
+
+    if (free_xl(ptr, usable_out))
       return true;
-    }
+
     return false;
   }
 
-  size_t usable_size(void* ptr) {
-    std::lock_guard<std::mutex> lk(heap_mu);
-    Segment* seg = find_segment_for(ptr);
-    if (seg)
-      return seg->usable_size(ptr);
-    auto xl_it = xl_allocs.find(reinterpret_cast<uintptr_t>(ptr));
-    if (xl_it != xl_allocs.end())
-      return xl_it->second;
-    return 0;
+  size_t usable_size(void *ptr) {
+    if (!ptr)
+      return 0;
+
+    ChunkHeader *chdr = reinterpret_cast<ChunkHeader *>(static_cast<char *>(ptr) - sizeof(ChunkHeader));
+    if (chdr->magic == CHUNK_MAGIC && chdr->owner) {
+      return chdr->owner->usable_size(ptr);
+    }
+
+    return usable_xl(ptr);
   }
 
   std::vector<segment_kind_t> get_segment_kinds() { return seg_kind; }
@@ -866,8 +1069,9 @@ public:
   bool is_corrupted() {
     if (canary == 0)
       return true;
-    for (size_t i = 0; i < layout.size(); ++i) {
-      if (!layout[i].check_canary(layout[i].get_key()))
+
+    for (const auto &seg : layout) {
+      if (!seg || !seg->check_canary(seg->get_key()))
         return true;
     }
     return false;
@@ -876,8 +1080,9 @@ public:
   bool validate() {
     if (is_corrupted())
       return false;
-    for (const Segment& seg : layout) {
-      if (seg.num_pages() == 0)
+
+    for (const auto &seg : layout) {
+      if (!seg || seg->num_pages() == 0)
         return false;
     }
     return true;
@@ -888,17 +1093,21 @@ public:
     if (base && reserved_size > 0) {
       free_segment(base, reserved_size);
     } else {
-      for (void* seg : seg_bases)
+      for (void *seg : seg_bases)
         free_segment(seg, SEGMENT_SIZE);
     }
-    for (const auto& kv : xl_allocs)
-      free_segment(reinterpret_cast<void*>(kv.first), kv.second);
+
     layout.clear();
     seg_kind.clear();
     seg_bases.clear();
     seg_page_kind.clear();
-    seg_index_by_base.clear();
-    xl_allocs.clear();
+
+    for (ClassShard &shard : class_shards) {
+      std::lock_guard<std::mutex> shard_lk(shard.mu);
+      shard.segments.clear();
+      shard.non_full_segments.clear();
+    }
+
     base = nullptr;
     reserved_size = 0;
     num_segments = 0;
@@ -908,36 +1117,32 @@ public:
   }
 };
 
-bool heap_register_segment(void* segment_base) {
-  return Heap::instance().add_segment(segment_base, SEGMENT_NORM, PAGE_SM);
+} // namespace
+
+bool heap_register_segment(void *segment_base) {
+  return HeapState::instance().add_segment(segment_base, SEGMENT_NORM, PAGE_SM);
 }
 
-void heap_clear_metadata() {
-  Heap::instance().clear_metadata();
-}
+void heap_clear_metadata() { HeapState::instance().clear_metadata(); }
 
-bool heap_init_reserved(void* reserved_base, size_t size) {
-  return Heap::instance().init_reserved(reserved_base, size);
+bool heap_init_reserved(void *reserved_base, size_t size) {
+  return HeapState::instance().init_reserved(reserved_base, size);
 }
 
 bool heap_add_segment_from_reserved(segment_kind_t kind) {
-  return Heap::instance().add_segment_from_reserved(kind, PAGE_SM);
+  return HeapState::instance().add_segment_from_reserved(kind, PAGE_SM);
 }
 
 bool heap_add_segment_for_class(page_kind_t kind) {
-  return Heap::instance().add_segment_from_reserved(SEGMENT_NORM, kind);
+  return HeapState::instance().add_segment_from_reserved(SEGMENT_NORM, kind);
 }
 
-void* heap_alloc(size_t size) {
-  return Heap::instance().allocate(size);
-}
+void *heap_alloc(size_t size) { return HeapState::instance().allocate(size); }
 
-size_t heap_usable_size(void* ptr) {
-  return Heap::instance().usable_size(ptr);
-}
+size_t heap_usable_size(void *ptr) { return HeapState::instance().usable_size(ptr); }
 
-bool free_dispatch_with_size(void* ptr, size_t* usable_size) {
-  return Heap::instance().free_ptr(ptr, usable_size);
+bool free_dispatch_with_size(void *ptr, size_t *usable_size) {
+  return HeapState::instance().free_ptr(ptr, usable_size);
 }
 
 void set_zero_on_free_enabled(bool enabled) {
@@ -948,8 +1153,6 @@ void set_uaf_check_enabled(bool enabled) {
   g_uaf_check.store(enabled, std::memory_order_relaxed);
 }
 
-bool heap_validate() {
-  return Heap::instance().validate();
-}
+bool heap_validate() { return HeapState::instance().validate(); }
 
 } // namespace zialloc::memory
