@@ -73,9 +73,9 @@ alloc, I will release memory to OS but keep the vmem reservation
   } while (0)
 
 typedef enum page_kind_e {
-  PAGE_SM,  // small blocks go into 64KiB pages inside a segment
-  PAGE_MED, // medium   ^   ^   ^   512KiB   ^    ^    ^    ^
-  PAGE_LG,  // large    ^   ^   ^   4MiB     ^    ^    ^    ^
+  PAGE_SM,  // small blocks go into 1mib pages inside a segment
+  PAGE_MED, // medium   ^   ^   ^   8mib   ^    ^    ^    ^
+  PAGE_LG,  // large    ^   ^   ^   16mib     ^    ^    ^    ^
   PAGE_XL   // x-large will either split(unlikely) or default to mmap.
 } page_kind_t;
 
@@ -99,13 +99,11 @@ typedef enum page_status_e { FULL, ACTIVE, EMPTY } page_status_t;
 // Compute usable = P - overhead
 // Set max_chunk = floor(usable / 2)
 typedef enum chunk_max_e {
-  // Increase small/medium qualifying limits so more requests stay in class
-  // fast paths before spilling to larger classes.
-  CHUNK_SM = 0x7800,   // (30 KiB)
-  CHUNK_MD = 0x60000,  // (384 KiB)
-  // large class targets a fixed one-slot 4MiB page path, so allow requests
-  // up to nearly a full large page before falling back to XL mapping.
-  CHUNK_LG = 0x3FFF00, // (4095 KiB)
+  // keep per-class max chunk <= ~half page so each page can hold at least 2
+  // chunks even after metadata/alignment
+  CHUNK_SM = 0x7FFF0,  // 512kib - 16b
+  CHUNK_MD = 0x3FFFF0, // 4mib - 16b
+  CHUNK_LG = 0x7FFFF0, // 8mib - 16b
   CHUNK_XL             // whatever it wants to be
 } chunk_max_t;
 

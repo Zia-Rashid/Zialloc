@@ -51,12 +51,14 @@ static inline size_t ceil_pow2_at_least_16(size_t n) {
 }
 
 static inline size_t norm_chunk_req(page_kind_t kind, size_t req) {
-  // bucket only small/medium classes to reduce page-sized fragmentation scans
-  if (kind != PAGE_SM && kind != PAGE_MED)
+  // bucket classed allocations to reduce mixed-size fragmentation scans
+  if (kind != PAGE_SM && kind != PAGE_MED && kind != PAGE_LG)
     return align_up(req, 16);
   size_t norm = ceil_pow2_at_least_16(req);
-  const size_t cap = (kind == PAGE_SM) ? static_cast<size_t>(CHUNK_SM)
-                                       : static_cast<size_t>(CHUNK_MD);
+  const size_t cap = (kind == PAGE_SM)
+                         ? static_cast<size_t>(CHUNK_SM)
+                         : (kind == PAGE_MED) ? static_cast<size_t>(CHUNK_MD)
+                                              : static_cast<size_t>(CHUNK_LG);
   if (norm > cap)
     norm = cap;
   return align_up(norm, 16);
@@ -252,18 +254,11 @@ public:
     const size_t span = page_size_for_kind(kind);
     size_t stride = 0;
     size_t cap = 0;
-    if (kind == PAGE_LG) {
-      // keep large class geometry fixed: one chunk per 4MiB page
-      // avoids reinitializing metadata on every varying large request
-      stride = span;
-      cap = 1;
-    } else {
-      const size_t norm_req = norm_chunk_req(kind, req_sz);
-      stride = align_up(norm_req + sizeof(ChunkHeader), 16);
-      if (stride == 0)
-        return false;
-      cap = span / stride;
-    }
+    const size_t norm_req = norm_chunk_req(kind, req_sz);
+    stride = align_up(norm_req + sizeof(ChunkHeader), 16);
+    if (stride == 0)
+      return false;
+    cap = span / stride;
     if (cap == 0 || cap > UINT32_MAX)
       return false;
 
@@ -490,8 +485,6 @@ public:
   }
 
   bool can_hold_request(size_t req) const {
-    if (size_class == PAGE_LG)
-      return true;
     if (!fixed_chunk_set.load(std::memory_order_relaxed))
       return true;
     return req <= fixed_chunk_usable.load(std::memory_order_relaxed);
@@ -522,43 +515,39 @@ public:
       if (mt) {
         std::lock_guard<std::mutex> lk(page_lock_for(&page));
         const size_t target_req =
-            (size_class != PAGE_LG && fixed_chunk_set.load(std::memory_order_relaxed))
+            (fixed_chunk_set.load(std::memory_order_relaxed))
                 ? fixed_chunk_usable.load(std::memory_order_relaxed)
                 : req;
         if (!page.is_initialized()) {
           void *page_base = static_cast<void *>(static_cast<char *>(base) + idx * page_size);
           if (!page.init(page_base, size_class, target_req))
             continue;
-          if (size_class != PAGE_LG &&
-              !fixed_chunk_set.load(std::memory_order_relaxed)) {
+          if (!fixed_chunk_set.load(std::memory_order_relaxed)) {
             fixed_chunk_usable.store(page.get_chunk_usable(), std::memory_order_relaxed);
             fixed_chunk_set.store(true, std::memory_order_relaxed);
           }
         }
         if (!page.can_hold(req)) {
-          if (size_class != PAGE_LG || !page.retune_if_empty(req) || !page.can_hold(req))
-            continue;
+          continue;
         }
 
         out = page.allocate(req, &before, &after); // dispatch to page lvl alloc
       } else {
         const size_t target_req =
-            (size_class != PAGE_LG && fixed_chunk_set.load(std::memory_order_relaxed))
+            (fixed_chunk_set.load(std::memory_order_relaxed))
                 ? fixed_chunk_usable.load(std::memory_order_relaxed)
                 : req;
         if (!page.is_initialized()) {
           void *page_base = static_cast<void *>(static_cast<char *>(base) + idx * page_size);
           if (!page.init(page_base, size_class, target_req))
             continue;
-          if (size_class != PAGE_LG &&
-              !fixed_chunk_set.load(std::memory_order_relaxed)) {
+          if (!fixed_chunk_set.load(std::memory_order_relaxed)) {
             fixed_chunk_usable.store(page.get_chunk_usable(), std::memory_order_relaxed);
             fixed_chunk_set.store(true, std::memory_order_relaxed);
           }
         }
         if (!page.can_hold(req)) {
-          if (size_class != PAGE_LG || !page.retune_if_empty(req) || !page.can_hold(req))
-            continue;
+          continue;
         }
 
         out = page.allocate(req, &before, &after);
