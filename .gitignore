@@ -14,7 +14,6 @@ bin/
 *.dylib
 *.dll
 *.exe
-zialloc
 
 # CMake
 CMakeCache.txt
