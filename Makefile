@@ -43,7 +43,6 @@ BIN_DIR   := bin
 ZIALLOC_MAIN := allocators/zialloc/alloc.cpp
 ifeq ($(ALLOCATOR),$(ZIALLOC_MAIN))
 ALLOC_CPP_SRCS := allocators/zialloc/alloc.cpp \
-				  allocators/zialloc/free.cpp \
 				  allocators/zialloc/os.cpp \
 				  allocators/zialloc/segments.cpp
 ALLOC_OBJ := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(ALLOC_CPP_SRCS))

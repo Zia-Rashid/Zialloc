@@ -18,8 +18,6 @@ bool setup_guard(void* ptr, size_t size);
 void lock_page(void* ptr, size_t size);
 void unlock_page(void* ptr, size_t size);
 
-// free-path entry
-void free_dispatch(void* ptr);
 bool free_dispatch_with_size(void* ptr, size_t* usable_size);
 void set_zero_on_free_enabled(bool enabled);
 void set_uaf_check_enabled(bool enabled);
@@ -31,11 +29,8 @@ size_t heap_usable_size(void* ptr);
 bool heap_validate();
 bool heap_add_segment_for_class(page_kind_t kind);
 
-// heap metadata registration 
-bool heap_register_segment(void* segment_base);
 void heap_clear_metadata();
 bool heap_init_reserved(void* reserved_base, size_t size);
-bool heap_add_segment_from_reserved(segment_kind_t kind);
 
 class Chunk;
 class Page;
@@ -43,12 +38,3 @@ class Segment;
 class Heap;
 
 } // namespace zialloc::memory
-
-namespace zialloc {
-
-// allocator hooks
-void allocator_free_internal(void* ptr);
-size_t allocator_usable_size_internal(void* ptr);
-bool allocator_validate_internal();
-
-} // namespace zialloc
