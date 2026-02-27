@@ -8,7 +8,7 @@ Zialloc uses fixed size classes for regular allocations plus a direct-mapped XL 
 - Reserved heap virtual address space (default): 2GiB
 - Segment size / alignment: 4MiB
 - Page classes: small (64KiB), medium (512KiB), large (4MiB), XL (direct OS mapping)
-- Chunk size thresholds used for class selection: `0x7800` (small), `0x3C000` (medium), `0x1FFF00` (large), above-threshold is XL
+- Chunk size thresholds used for class selection: `30KiB` (small), `384LiB` (medium), `4095KiB` (large), above this threshold is XL
 
 Regular sized chunks are aligned to 16 byte boundaries before being placed
 
@@ -39,17 +39,17 @@ Page
 | Chunk 0 | Chunk 1 | Chunk 2 | ... | Chunk K |
 ```
 
-XL allocations bypass the segment/page system and use directly mapped regions that are tracked in `xl_allocs`.
+XL allocations bypass the segment/page system and use directly mmapped regions that are tracked in `xl_allocs`.
 
-Metadat is stored Out-of-line, zialloc keeps metadata in allocator-owned structures (PageRuntime/Chunk vectors and segment/page structures), and the returned pointer is the raw chunk w/ no inline header. XL allocations are tracked in xl_allocs (which are also out-of-line)
+Metadat is stored both inline and out of line, zialloc keeps most metadata in allocator owned structures, but the returned pointer to the chunk has an inline header denoting it's index and it's parent Page. XL allocations are tracked in xl_allocs (which are also out-of-line)
 
 ## Allocation Workflow
 Allocation starts through allocator API wrappers and then `Heap::allocate(size)`.
 
 Main behavior:
 - `malloc/calloc/realloc` validate size and ensure heap initialization.
-- Requested size is classed: small/medium/large/XL.
-- For non-XL classes, allocator tries the fastest path first and progresses to the slowest: thread cached page, preferred segment, existing matching-class segments, reserved-space segment growth, then fresh OS-mapped segment.
+- Requested size is classed: small/medium/large/XL
+- For non-XL classes, allocator tries the fastest path first and progresses to the slowest: thread cached page, preferred segment, other matching-class segments, reserved-space segment growth, then an OS-mapped segment
 - For XL class, map aligned memory directly and record allocation size in `xl_allocs`.
 
 Allocation flow (simplified):
@@ -61,7 +61,7 @@ malloc(size)
   |
   +--> class_for_size(size)
          |
-         +--> XL ? -------- yes ---> map XL region -> track in xl_allocs -> return
+         +--> XL ? -------- yes ---> map XL region -> track -> return
          | no
          v
       align size to 16
