@@ -415,8 +415,6 @@ public:
   page_status_t get_status() const { return status; }
   size_t get_chunk_usable() const { return chunk_usable; }
   pid_t get_owner_tid() const { return owner_tid; }
-  uintptr_t get_base_addr() const { return reinterpret_cast<uintptr_t>(base); }
-  size_t get_span_size() const { return page_span; }
   size_t get_segment_index() const { return owner_segment_idx; }
   Segment *get_owner_segment() const { return owner_segment; }
 };
@@ -512,45 +510,32 @@ public:
       void *out = nullptr;
       page_status_t before = EMPTY;
       page_status_t after = EMPTY;
+      auto alloc_from_page = [&]() -> void * {
+        const size_t target_req =
+            (fixed_chunk_set.load(std::memory_order_relaxed))
+                ? fixed_chunk_usable.load(std::memory_order_relaxed)
+                : req;
+        if (!page.is_initialized()) {
+          void *page_base = static_cast<void *>(static_cast<char *>(base) + idx * page_size);
+          if (!page.init(page_base, size_class, target_req))
+            return nullptr;
+          if (!fixed_chunk_set.load(std::memory_order_relaxed)) {
+            fixed_chunk_usable.store(page.get_chunk_usable(), std::memory_order_relaxed);
+            fixed_chunk_set.store(true, std::memory_order_relaxed);
+          }
+        }
+        if (!page.can_hold(req)) {
+          return nullptr;
+        }
+
+        return page.allocate(req, &before, &after);
+      };
+
       if (mt) {
         std::lock_guard<std::mutex> lk(page_lock_for(&page));
-        const size_t target_req =
-            (fixed_chunk_set.load(std::memory_order_relaxed))
-                ? fixed_chunk_usable.load(std::memory_order_relaxed)
-                : req;
-        if (!page.is_initialized()) {
-          void *page_base = static_cast<void *>(static_cast<char *>(base) + idx * page_size);
-          if (!page.init(page_base, size_class, target_req))
-            continue;
-          if (!fixed_chunk_set.load(std::memory_order_relaxed)) {
-            fixed_chunk_usable.store(page.get_chunk_usable(), std::memory_order_relaxed);
-            fixed_chunk_set.store(true, std::memory_order_relaxed);
-          }
-        }
-        if (!page.can_hold(req)) {
-          continue;
-        }
-
-        out = page.allocate(req, &before, &after); // dispatch to page lvl alloc
+        out = alloc_from_page();
       } else {
-        const size_t target_req =
-            (fixed_chunk_set.load(std::memory_order_relaxed))
-                ? fixed_chunk_usable.load(std::memory_order_relaxed)
-                : req;
-        if (!page.is_initialized()) {
-          void *page_base = static_cast<void *>(static_cast<char *>(base) + idx * page_size);
-          if (!page.init(page_base, size_class, target_req))
-            continue;
-          if (!fixed_chunk_set.load(std::memory_order_relaxed)) {
-            fixed_chunk_usable.store(page.get_chunk_usable(), std::memory_order_relaxed);
-            fixed_chunk_set.store(true, std::memory_order_relaxed);
-          }
-        }
-        if (!page.can_hold(req)) {
-          continue;
-        }
-
-        out = page.allocate(req, &before, &after);
+        out = alloc_from_page();
       }
 
       if (!out)
@@ -592,30 +577,19 @@ public:
   }
 };
 
-typedef struct tc_page_s {
-  Page *loc;
-  page_kind_t kind;
-  size_t size;
-  void *freelist;
-} tc_page_t;
-
 class ThreadCache {
 private:
   static std::atomic<uint32_t> live_threads;
   pid_t tid;
   bool is_active;
-  std::vector<tc_page_t *> pages;
   Page *cached_pages[3];
-  uintptr_t cached_page_bases[3];
-  uintptr_t cached_page_ends[3];
   size_t preferred_seg_idx[3];
   bool preferred_seg_valid[3];
 
 public:
   ThreadCache()
-      : tid(current_tid()), is_active(true), pages(),
-        cached_pages{nullptr, nullptr, nullptr}, cached_page_bases{0, 0, 0},
-        cached_page_ends{0, 0, 0}, preferred_seg_idx{0, 0, 0},
+      : tid(current_tid()), is_active(true), cached_pages{nullptr, nullptr, nullptr},
+        preferred_seg_idx{0, 0, 0},
         preferred_seg_valid{false, false, false} {
     live_threads.fetch_add(1, std::memory_order_relaxed);
     g_live_threads.fetch_add(1, std::memory_order_relaxed);
@@ -644,13 +618,11 @@ public:
     return cached_pages[class_index_for_kind(kind)];
   }
 
-  void cache_page(page_kind_t kind, Page *page, uintptr_t page_base, size_t page_size) {
+  void cache_page(page_kind_t kind, Page *page) {
     if (kind > PAGE_LG)
       return;
     const size_t idx = class_index_for_kind(kind);
     cached_pages[idx] = page;
-    cached_page_bases[idx] = page_base;
-    cached_page_ends[idx] = page_base + page_size;
   }
 
   void clear_cached_page(page_kind_t kind, Page *page) {
@@ -659,8 +631,6 @@ public:
     const size_t idx = class_index_for_kind(kind);
     if (cached_pages[idx] == page) {
       cached_pages[idx] = nullptr;
-      cached_page_bases[idx] = 0;
-      cached_page_ends[idx] = 0;
     }
   }
 
@@ -695,15 +665,11 @@ struct ClassShard {
 
 class HeapState {
 private:
-  memid_t memid;
   void *base;
   size_t reserved_size;
   uint32_t num_segments;
   std::vector<std::unique_ptr<Segment>> layout;
-  std::vector<segment_kind_t> seg_kind;
   std::vector<void *> seg_bases;
-  std::vector<page_kind_t> seg_page_kind;
-  memkind_t mem_kind;
   uint64_t canary;
   size_t reserved_cursor;
   std::mutex heap_mu;
@@ -727,7 +693,7 @@ private:
     shard.non_full_segments.push_back(seg_idx);
   }
 
-  bool add_segment_nolock(void *segment_base, segment_kind_t kind, page_kind_t page_kind) {
+  bool add_segment_nolock(void *segment_base, page_kind_t page_kind) {
     if (!segment_base)
       return false;
 
@@ -737,9 +703,7 @@ private:
       return false;
 
     layout.push_back(std::move(seg));
-    seg_kind.push_back(kind);
     seg_bases.push_back(segment_base);
-    seg_page_kind.push_back(page_kind);
     num_segments = static_cast<uint32_t>(layout.size());
 
     ClassShard &shard = shard_for(page_kind);
@@ -755,7 +719,7 @@ private:
     return true;
   }
 
-  bool add_segment_from_reserved_nolock(segment_kind_t kind, page_kind_t page_kind) {
+  bool add_segment_from_reserved_nolock(page_kind_t page_kind) {
     if (!base || reserved_size == 0)
       return false;
     if (reserved_cursor + SEGMENT_SIZE > reserved_size)
@@ -766,7 +730,7 @@ private:
       return false;
 
     reserved_cursor += SEGMENT_SIZE;
-    return add_segment_nolock(seg_base, kind, page_kind);
+    return add_segment_nolock(seg_base, page_kind);
   }
 
   void *alloc_xl(size_t size) {
@@ -819,8 +783,8 @@ private:
 
 public:
   HeapState()
-      : memid(), base(nullptr), reserved_size(0), num_segments(0), layout(),
-        seg_kind(), seg_bases(), seg_page_kind(), mem_kind(MEM_NONE), canary(0),
+      : base(nullptr), reserved_size(0), num_segments(0), layout(),
+        seg_bases(), canary(0),
         reserved_cursor(0), heap_mu(), class_shards() {}
 
   static HeapState &instance() {
@@ -837,13 +801,10 @@ public:
     reserved_size = size;
     reserved_cursor = 0;
     canary = generate_canary();
-    mem_kind = MEM_OS;
 
     const size_t cap = size / SEGMENT_SIZE;
     layout.reserve(cap);
-    seg_kind.reserve(cap);
     seg_bases.reserve(cap);
-    seg_page_kind.reserve(cap);
 
     for (ClassShard &shard : class_shards) {
       std::lock_guard<std::mutex> shard_lk(shard.mu);
@@ -854,14 +815,9 @@ public:
     return true;
   }
 
-  bool add_segment(void *segment_base, segment_kind_t kind, page_kind_t page_kind) {
+  bool add_segment_from_reserved(page_kind_t page_kind) {
     std::lock_guard<std::mutex> lk(heap_mu);
-    return add_segment_nolock(segment_base, kind, page_kind);
-  }
-
-  bool add_segment_from_reserved(segment_kind_t kind, page_kind_t page_kind) {
-    std::lock_guard<std::mutex> lk(heap_mu);
-    return add_segment_from_reserved_nolock(kind, page_kind);
+    return add_segment_from_reserved_nolock(page_kind);
   }
 
   void *allocate(size_t size) {
@@ -930,7 +886,7 @@ public:
       if (tc->get_active()) {
         tc->set_preferred_segment(kind, seg_idx);
         if (page)
-          tc->cache_page(kind, page, page->get_base_addr(), page->get_span_size());
+          tc->cache_page(kind, page);
       }
       if (page)
         g_last_alloc_usable = page->get_chunk_usable();
@@ -992,7 +948,7 @@ public:
     // grow from reserved heap (ideal) instead of mmaping more mem to expand.
     {
       std::lock_guard<std::mutex> lk(heap_mu);
-      if (add_segment_from_reserved_nolock(SEGMENT_NORM, kind)) {
+      if (add_segment_from_reserved_nolock(kind)) {
         return try_segment(layout.size() - 1);
       }
     }
@@ -1003,7 +959,7 @@ public:
 
     {
       std::lock_guard<std::mutex> lk(heap_mu);
-      if (!add_segment_nolock(seg_mem, SEGMENT_NORM, kind)) {
+      if (!add_segment_nolock(seg_mem, kind)) {
         free_segment(seg_mem, SEGMENT_SIZE);
         return nullptr;
       }
@@ -1050,7 +1006,7 @@ public:
       }
 
       if (tc->get_active()) {
-        tc->cache_page(kind, page, page->get_base_addr(), page->get_span_size());
+        tc->cache_page(kind, page);
         if (page->get_status() == EMPTY)
           tc->clear_cached_page(kind, page);
       }
@@ -1076,7 +1032,6 @@ public:
     return usable_xl(ptr);
   }
 
-  std::vector<segment_kind_t> get_segment_kinds() { return seg_kind; }
   uint32_t get_num_segments() { return num_segments; }
 
   bool is_corrupted() {
@@ -1111,9 +1066,7 @@ public:
     }
 
     layout.clear();
-    seg_kind.clear();
     seg_bases.clear();
-    seg_page_kind.clear();
 
     for (ClassShard &shard : class_shards) {
       std::lock_guard<std::mutex> shard_lk(shard.mu);
@@ -1125,16 +1078,11 @@ public:
     reserved_size = 0;
     num_segments = 0;
     canary = 0;
-    mem_kind = MEM_NONE;
     reserved_cursor = 0;
   }
 };
 
 } // namespace
-
-bool heap_register_segment(void *segment_base) {
-  return HeapState::instance().add_segment(segment_base, SEGMENT_NORM, PAGE_SM);
-}
 
 void heap_clear_metadata() { HeapState::instance().clear_metadata(); }
 
@@ -1142,12 +1090,8 @@ bool heap_init_reserved(void *reserved_base, size_t size) {
   return HeapState::instance().init_reserved(reserved_base, size);
 }
 
-bool heap_add_segment_from_reserved(segment_kind_t kind) {
-  return HeapState::instance().add_segment_from_reserved(kind, PAGE_SM);
-}
-
 bool heap_add_segment_for_class(page_kind_t kind) {
-  return HeapState::instance().add_segment_from_reserved(SEGMENT_NORM, kind);
+  return HeapState::instance().add_segment_from_reserved(kind);
 }
 
 void *heap_alloc(size_t size) { return HeapState::instance().allocate(size); }
