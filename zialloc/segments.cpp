@@ -1121,6 +1121,7 @@ bool heap_validate() { return HeapState::instance().validate(); }
     - implement a toggle-able UAF checker in deffered ring, to act as pseudo temporal quarantining
     - Make XL allocations first take from our pre-reserved space instead of a custom mapping. 
         only expanding making a standalone mmap/mapping if there isn't adequate space in reserved heap. 
+        it should start from the end and move towards the rest of the segments though so that the segments are contiguous
     - 
     - 
 */
