@@ -362,11 +362,11 @@ public:
 
     *before = status;
     const uint32_t slot = hdr->slot;
-    if (!bit_is_set(slot))
+    if (!bit_is_set(slot))    // double free detected. should probably make a macro for this.
       std::abort();
 
     if (g_zero_on_free.load(std::memory_order_relaxed)) {
-      std::memset(ptr, 0, chunk_usable);
+      std::memset(ptr, 0, chunk_usable);  
     }
 
     bit_clear(slot);
@@ -1115,3 +1115,12 @@ void set_uaf_check_enabled(bool enabled) {
 bool heap_validate() { return HeapState::instance().validate(); }
 
 } // namespace zialloc::memory
+
+/*
+  TODOs:
+    - implement a toggle-able UAF checker in deffered ring, to act as pseudo temporal quarantining
+    - Make XL allocations first take from our pre-reserved space instead of a custom mapping. 
+        only expanding making a standalone mmap/mapping if there isn't adequate space in reserved heap. 
+    - 
+    - 
+*/
