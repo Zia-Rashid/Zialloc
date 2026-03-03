@@ -76,14 +76,7 @@ static inline size_t class_index_for_kind(page_kind_t kind) {
 class Page;
 class Segment;
 
-static constexpr uint32_t CHUNK_MAGIC = 0xC47A110CU;
 static constexpr uint64_t XL_MAGIC = 0x584C4F43484B4559ULL; // "XLOCHKEY"
-
-struct ChunkHeader {
-  Page *owner;
-  uint32_t slot;
-  uint32_t magic;
-};
 
 struct XLHeader {
   uint64_t 	magic;
@@ -170,7 +163,6 @@ private:
   void *base;
   page_kind_t size_class;
   size_t page_span;
-  size_t chunk_stride;
   size_t chunk_usable;
   uint32_t capacity;
   uint32_t used;
@@ -181,17 +173,27 @@ private:
   std::vector<uint64_t> used_bitmap;
   DeferredRing deferred_frees;
 
-  ChunkHeader *slot_header(uint32_t slot) const {
-    return reinterpret_cast<ChunkHeader *>(static_cast<char *>(base) +
-                                           static_cast<size_t>(slot) * chunk_stride);
+  void *slot_ptr(uint32_t slot) const {
+    return static_cast<void *>(static_cast<char *>(base) +
+                               static_cast<size_t>(slot) * chunk_usable);
   }
 
-  void *slot_user_ptr(uint32_t slot) const {
-    return static_cast<void *>(reinterpret_cast<char *>(slot_header(slot)) + sizeof(ChunkHeader));
-  }
+  bool ptr_to_slot_idx(void *ptr, uint32_t *slot_out) const {
+    if (!initialized || !ptr || !slot_out || chunk_usable == 0)
+      return false;
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base);
 
-  ChunkHeader *user_to_header(void *ptr) const {
-    return reinterpret_cast<ChunkHeader *>(static_cast<char *>(ptr) - sizeof(ChunkHeader));
+    PTR_IN_BOUNDS(b < p, "Chunk pointer points before owning page..."); // if(p < b) => bad bad bad
+
+    const size_t offset = static_cast<size_t>(p - b);
+    if ((offset % chunk_usable) != 0) // should be aligned at this point
+      return false;
+    const size_t slot = offset / chunk_usable;
+    if (slot >= capacity)
+      return false;
+    *slot_out = static_cast<uint32_t>(slot);
+    return true;
   }
 
   bool bit_is_set(uint32_t idx) const {
@@ -212,17 +214,6 @@ private:
     used_bitmap[word] &= ~(1ULL << bit);
   }
 
-  bool validate_header(void *ptr, ChunkHeader *hdr) const {
-    if (!hdr)
-      return false;
-    if (hdr->magic != CHUNK_MAGIC)
-      return false;
-    if (hdr->owner != this)
-      return false;
-    if (hdr->slot >= capacity)
-      return false;
-    return slot_user_ptr(hdr->slot) == ptr;
-  }
 
   void drain_deferred_locked(size_t max_to_drain) { 
     size_t drained = 0;
@@ -238,7 +229,7 @@ private:
 public:
   Page()
       : owner_segment(nullptr), owner_segment_idx(0), base(nullptr), size_class(PAGE_SM),
-        page_span(0), chunk_stride(0), chunk_usable(0), capacity(0), used(0),
+        page_span(0), chunk_usable(0), capacity(0), used(0),
         first_hint(0), owner_tid(0), status(EMPTY), initialized(false), used_bitmap(),
         deferred_frees() {}
 
@@ -252,21 +243,17 @@ public:
       return false;
 
     const size_t span = page_size_for_kind(kind);
-    size_t stride = 0;
-    size_t cap = 0;
-    const size_t norm_req = norm_chunk_req(kind, req_sz);
-    stride = align_up(norm_req + sizeof(ChunkHeader), 16);
+    const size_t stride = norm_chunk_req(kind, req_sz);
     if (stride == 0)
       return false;
-    cap = span / stride;
+    const size_t cap = span / stride;
     if (cap == 0 || cap > UINT32_MAX)
       return false;
 
     base = page_base;
     size_class = kind;
     page_span = span;
-    chunk_stride = stride;
-    chunk_usable = stride - sizeof(ChunkHeader);
+    chunk_usable = stride;
     capacity = static_cast<uint32_t>(cap);
     used = 0;
     first_hint = 0;
@@ -332,13 +319,8 @@ public:
             owner_tid = current_tid();
           status = (used == capacity) ? FULL : ACTIVE;
 
-          ChunkHeader *hdr = slot_header(slot);
-          hdr->owner = this;
-          hdr->slot = slot;
-          hdr->magic = CHUNK_MAGIC;
-
           *after = status;
-          return slot_user_ptr(slot);
+          return slot_ptr(slot);
         }
       }
       word_idx = (word_idx + 1) % words;
@@ -355,14 +337,12 @@ public:
                   page_status_t *after) {
     if (!contains_ptr(ptr))
       return false;
-
-    ChunkHeader *hdr = user_to_header(ptr);
-    if (!validate_header(ptr, hdr))
+    uint32_t slot = 0;
+    if (!ptr_to_slot_idx(ptr, &slot))
       return false;
 
     *before = status;
-    const uint32_t slot = hdr->slot;
-    if (!bit_is_set(slot))    // double free detected. should probably make a macro for this.
+    if (!bit_is_set(slot))
       std::abort();
 
     if (g_zero_on_free.load(std::memory_order_relaxed)) {
@@ -385,10 +365,11 @@ public:
   bool enqueue_deferred_free(void *ptr, size_t *usable_out) {
     if (!contains_ptr(ptr))
       return false;
-
-    ChunkHeader *hdr = user_to_header(ptr);
-    if (!validate_header(ptr, hdr))
+    uint32_t slot = 0;
+    if (!ptr_to_slot_idx(ptr, &slot))
       return false;
+    if (!bit_is_set(slot))
+      std::abort();
 
     if (usable_out)
       *usable_out = chunk_usable;
@@ -398,13 +379,12 @@ public:
   size_t usable_size(void *ptr) const {
     if (!contains_ptr(ptr))
       return 0;
-
-    ChunkHeader *hdr = user_to_header(ptr);
-    if (!validate_header(ptr, hdr))
+    uint32_t slot = 0;
+    if (!ptr_to_slot_idx(ptr, &slot))
       return 0;
 
     if (g_uaf_check.load(std::memory_order_relaxed)) {
-      if (!bit_is_set(hdr->slot))
+      if (!bit_is_set(slot))
         std::abort();
     }
 
@@ -476,6 +456,19 @@ public:
     const uintptr_t b = reinterpret_cast<uintptr_t>(base);
     const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
     return p >= b && p < (b + SEGMENT_SIZE);
+  }
+
+  bool resolve_page_for_ptr(void *ptr, Page **page_out) {
+    if (!ptr || !page_out || !contains(ptr) || page_size == 0)
+      return false;
+    const uintptr_t b = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    const size_t offset = static_cast<size_t>(p - b);
+    const size_t idx = offset / page_size;
+    if (idx >= page_count)
+      return false;
+    *page_out = &pages[idx];
+    return true;
   }
 
   bool has_free_pages() const {
@@ -781,6 +774,70 @@ private:
     return hdr->usable_size;
   }
 
+  bool resolve_segment_for_ptr(void *ptr, size_t *seg_idx_out, Segment **seg_out) {
+    if (!ptr || !seg_idx_out || !seg_out)
+      return false;
+
+    const uintptr_t p = reinterpret_cast<uintptr_t>(ptr);
+    if (base && reserved_cursor > 0) {
+      const uintptr_t b = reinterpret_cast<uintptr_t>(base);
+      const uintptr_t end = b + reserved_cursor;
+      if (p >= b && p < end) {
+        const size_t idx = static_cast<size_t>((p - b) / SEGMENT_SIZE);
+        if (idx < layout.size()) {
+          Segment *seg = layout[idx].get();
+          if (seg && seg->contains(ptr)) {
+            *seg_idx_out = idx;
+            *seg_out = seg;
+            return true;
+          }
+        }
+      }
+    }
+    // TODO: still not sure if '~' is correct since i already subtract 1 from segment shift in type.h
+    const uintptr_t seg_base = p & ~static_cast<uintptr_t>(SEGMENT_MASK); 
+    for (size_t i = 0; i < seg_bases.size(); ++i) {
+      if (reinterpret_cast<uintptr_t>(seg_bases[i]) != seg_base)
+        continue;
+      if (i >= layout.size())
+        continue;
+      Segment *seg = layout[i].get();
+      if (seg && seg->contains(ptr)) {
+        *seg_idx_out = i;
+        *seg_out = seg;
+        return true;
+      }
+    }
+    // TODO: confirm neither this nor the above are necessary
+    for (size_t i = 0; i < layout.size(); ++i) {
+      Segment *seg = layout[i].get();
+      if (seg && seg->contains(ptr)) {
+        *seg_idx_out = i;
+        *seg_out = seg;
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  bool resolve_page_for_ptr(void *ptr, size_t *seg_idx_out, Segment **seg_out,
+                            Page **page_out) {
+    if (!ptr || !seg_idx_out || !seg_out || !page_out)
+      return false;
+    size_t seg_idx = 0;
+    Segment *seg = nullptr;
+    if (!resolve_segment_for_ptr(ptr, &seg_idx, &seg))
+      return false;
+    Page *page = nullptr;
+    if (!seg->resolve_page_for_ptr(ptr, &page))
+      return false;
+    *seg_idx_out = seg_idx;
+    *seg_out = seg;
+    *page_out = page;
+    return true;
+  }
+
 public:
   HeapState()
       : base(nullptr), reserved_size(0), num_segments(0), layout(),
@@ -827,9 +884,7 @@ public:
 
     page_kind_t kind = class_for_size(size);
     if (kind == PAGE_XL) {
-      // goto xl path?
-      const size_t large_fit_limit = LARGE_PAGE_SIZE - sizeof(ChunkHeader);
-      if (size <= large_fit_limit) {
+      if (size <= LARGE_PAGE_SIZE) {
         kind = PAGE_LG;
       } else {
         return alloc_xl(size);
@@ -972,15 +1027,10 @@ public:
       return true;
 
     ThreadCache *tc = ThreadCache::current();
-
-    ChunkHeader *chdr = reinterpret_cast<ChunkHeader *>(
-        static_cast<char *>(ptr) - sizeof(ChunkHeader));
-    if (chdr->magic == CHUNK_MAGIC && chdr->owner) {
-      Page *page = chdr->owner;
-      Segment *seg = page->get_owner_segment();
-      if (!seg)
-        return false;
-
+    size_t seg_idx = 0;
+    Segment *seg = nullptr;
+    Page *page = nullptr;
+    if (resolve_page_for_ptr(ptr, &seg_idx, &seg, &page)) {
       const page_kind_t kind = page->get_size_class();
       const pid_t owner_tid = page->get_owner_tid();
       const bool remote_owner = (owner_tid != 0 && owner_tid != tc->get_tid());
@@ -999,10 +1049,10 @@ public:
       }
 
       if (!ok)
-        std::abort();
+        return false;
 
       if (!remote_owner && before == FULL && after != FULL) {
-        enqueue_non_full_segment(kind, page->get_segment_index());
+        enqueue_non_full_segment(kind, seg_idx);
       }
 
       if (tc->get_active()) {
@@ -1024,10 +1074,11 @@ public:
     if (!ptr)
       return 0;
 
-    ChunkHeader *chdr = reinterpret_cast<ChunkHeader *>(
-        static_cast<char *>(ptr) - sizeof(ChunkHeader));
-    if (chdr->magic == CHUNK_MAGIC && chdr->owner)
-      return chdr->owner->usable_size(ptr);
+    size_t seg_idx = 0;
+    Segment *seg = nullptr;
+    Page *page = nullptr;
+    if (resolve_page_for_ptr(ptr, &seg_idx, &seg, &page))
+      return page->usable_size(ptr);
 
     return usable_xl(ptr);
   }

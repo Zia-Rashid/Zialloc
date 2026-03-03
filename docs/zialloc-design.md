@@ -35,8 +35,8 @@ Within one page, all slots have identical stride/usable size and allocation stat
 
 XL allocations semi-bypass the page/segment class system and are mmapped as standalone mappings with inline XL headers.
 
-Metadata model is mixed inline + allocator-owned(OOL):
-- Inline per regular chunk header: owning page pointer, slot index, magic value (canary)
+Metadata model is entirely allocator-owned(OOL):
+- Chunks can resolve their owning page and slot idx using pointer arithmetic on themselves
 - Per-page metadata: bitmap, used counts, owner TID, deferred-free ring
 - Per-segment metadata: class, page array, full-page count, chunk-geometry lock-in, integrity key/canary
 - XL metadata is inline in front of returned pointer (`XLHeader`)

@@ -1,38 +1,6 @@
 #ifndef SEGMENTS_H
 #define SEGMENTS_H
 
-/*
-    Heap-Level:     |Metadata|Segment|guard|Segment|guard|Segment|...| # size =
-2GB Segment-Level:  |Metadata|guard|slot|slot|slot|...| # size = 4MB->(32MB*)
-(this would mean that about 2048 segments couldfit inside of our heap at any
-time which is almost a bit too much so what I will actualy do is set this value
-higher meaning each segment is larger. if we use the same pointer access trick
-as before and maintain our alignment then we should be able to access any given
-page in constant time so it hsouldn't be that big of a deal that we have a
-larger segment size. Thus set segment size to say 32MB?) Page-Level:
-|Metadata|chunk|chunk|chunk|...|guard|                      # size : small=64KB,
-med=512KB, large=4MiB   ---> this means we can fit multiple large pages w/i a
-segment, XL allocations will still be handled using MMAP.
-
-    Heap metadata: we should track how many segments are active, their types,
-the location of the metadata corresponding to a given chunk so that we can
-access it if it contains a size and space we need.
-.
-    It contains information about the sizes that the pages w/i it support, a
-bitmap that tracks the allocation status of the contained pages. This can be
-found by querying the metadata of each page and checking if used == 0. Maybe
-also track the status of the segment itself; any given segment could be
-completely empty, active, or full. But we should probably make sure there is a
-minimum number (1sm, 1md) active at all times.
-
-
-    I don't intend to implement any form of coalescing - much like partition
-alloc, I will release memory to OS but keep the vmem reservation
-
-*/
-// lets make sure our guard pages are the same size as the chunks so that we can
-// handle indexing w/ offsets normally
-
 #include "types.h"
 #include <cstdint>
 #include <iostream>
